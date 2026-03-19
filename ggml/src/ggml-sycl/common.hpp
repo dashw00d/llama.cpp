@@ -52,6 +52,8 @@ extern int g_ggml_sycl_debug;
 extern int g_ggml_sycl_disable_optimize;
 extern int g_ggml_sycl_prioritize_dmmv;
 extern int g_ggml_sycl_enable_flash_attention;
+extern int g_ggml_sycl_bounce_buffer;
+extern int g_ggml_sycl_direct_mmap_dma;
 
 
 #if defined(__clang__) && __has_builtin(__builtin_expect)
@@ -218,6 +220,10 @@ struct sycl_device_info {
     size_t  total_vram;
     //sycl_hw_info hw_info;     \\ device id and aarch, currently not used
     optimize_feature opt_feature;
+    // Cached device capabilities — queried once at init, immutable thereafter.
+    // Replaces per-op has_capability_or_fail() runtime checks.
+    bool    has_fp16;           // sycl::aspect::fp16
+    bool    is_intel_arc;       // Intel Arc GPU (DG2) — enables direct mmap DMA fast path
 };
 
 
@@ -232,6 +238,14 @@ struct ggml_sycl_device_info {
 };
 
 const ggml_sycl_device_info & ggml_sycl_info();
+
+// Fast cached capability check — replaces per-op dpct::has_capability_or_fail() calls.
+// Device capabilities are immutable; query once at init via ggml_sycl_info().
+// This is a no-op in release builds when NDEBUG is defined.
+inline void ggml_sycl_assert_fp16(int device_id) {
+    GGML_ASSERT(ggml_sycl_info().devices[device_id].has_fp16 &&
+                "fp16 required but not supported on this device");
+}
 
 struct ggml_sycl_pool {
     virtual ~ggml_sycl_pool() = default;
@@ -311,10 +325,67 @@ struct ggml_backend_sycl_context {
 
     queue_ptr qptrs[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS] = { { nullptr } };
 
+    // Pre-allocated pinned staging buffer for cross-device copies.
+    // Grows as needed, never shrinks. One per context (per device).
+    void *  staging_buf      = nullptr;
+    size_t  staging_buf_size = 0;
+    sycl::context staging_sycl_ctx;
+    bool    staging_ctx_valid = false;
+
+    // Pre-allocated pinned host buffer for MUL_MAT_ID routing IDs.
+    // Avoids heap allocation + memcpy per call. Grows as needed.
+    void *  ids_pinned_buf      = nullptr;
+    size_t  ids_pinned_buf_size = 0;
+
     explicit ggml_backend_sycl_context(int device) :
         device(device),
         name(GGML_SYCL_NAME + std::to_string(device)) {
         opt_feature = ggml_sycl_info().devices[device].opt_feature;
+    }
+
+    ~ggml_backend_sycl_context() {
+        if (staging_buf && staging_ctx_valid) {
+            sycl::free(staging_buf, staging_sycl_ctx);
+            staging_buf = nullptr;
+        }
+        if (ids_pinned_buf && staging_ctx_valid) {
+            sycl::free(ids_pinned_buf, staging_sycl_ctx);
+            ids_pinned_buf = nullptr;
+        }
+    }
+
+    void * get_staging(size_t nbytes) {
+        if (nbytes <= staging_buf_size && staging_buf) {
+            return staging_buf;
+        }
+        // Grow: free old, allocate new (rounded up to 1MB granularity)
+        if (staging_buf && staging_ctx_valid) {
+            sycl::free(staging_buf, staging_sycl_ctx);
+        }
+        staging_sycl_ctx = stream(device, 0)->get_context();
+        staging_ctx_valid = true;
+        size_t alloc_size = ((nbytes + (1 << 20) - 1) >> 20) << 20; // round to 1MB
+        staging_buf = sycl::malloc_host(alloc_size, staging_sycl_ctx);
+        staging_buf_size = staging_buf ? alloc_size : 0;
+        return staging_buf;
+    }
+
+    // Get pinned host buffer for MUL_MAT_ID routing IDs (avoids heap alloc per call)
+    void * get_ids_pinned(size_t nbytes) {
+        if (nbytes <= ids_pinned_buf_size && ids_pinned_buf) {
+            return ids_pinned_buf;
+        }
+        if (ids_pinned_buf && staging_ctx_valid) {
+            sycl::free(ids_pinned_buf, staging_sycl_ctx);
+        }
+        if (!staging_ctx_valid) {
+            staging_sycl_ctx = stream(device, 0)->get_context();
+            staging_ctx_valid = true;
+        }
+        size_t alloc_size = ((nbytes + 4095) >> 12) << 12; // round to 4KB
+        ids_pinned_buf = sycl::malloc_host(alloc_size, staging_sycl_ctx);
+        ids_pinned_buf_size = ids_pinned_buf ? alloc_size : 0;
+        return ids_pinned_buf;
     }
 
     queue_ptr stream(int device, int stream) {
@@ -414,7 +485,26 @@ struct ggml_backend_sycl_context {
     }
 
 #ifdef GGML_SYCL_GRAPH
-    std::unique_ptr<sycl_ex::command_graph<sycl_ex::graph_state::executable>> exec_graph = nullptr;
+    // Per-subgraph graph cache: keyed by shape signature hash.
+    // Cache compiled SYCL executable graphs keyed by topology (ops+types).
+    // Each entry also stores a shape_hash — when KV cache growth changes tensor
+    // ne[] dimensions, the entry is re-recorded in-place rather than creating
+    // unbounded new entries.
+    struct graph_cache_entry {
+        std::unique_ptr<syclexp::command_graph<syclexp::graph_state::executable>> exec;
+        bool updatable = false;
+        uint64_t shape_hash = 0; // full ne[] shape hash for exact-match verification
+        std::vector<void*> recorded_data_ptrs; // data pointers at record time (non-updatable only)
+        int ptr_miss_count = 0; // pointer mismatch count for stability tracking
+                                // 0 = stable (use graph replay)
+                                // 1 = first mismatch (re-record once to check)
+                                // >=2 = unstable (skip graphs, direct dispatch)
+    };
+    std::unordered_map<uint64_t, graph_cache_entry> graph_cache;
+    // Set to true while inside begin_recording()/end_recording() so that
+    // kernel dispatch paths can avoid host-synchronizing library calls
+    // (e.g. oneMKL gemm) that are incompatible with SYCL command graph recording.
+    bool graph_recording = false;
 #endif
 
     ggml_sycl_pool & host_pool(int device) {

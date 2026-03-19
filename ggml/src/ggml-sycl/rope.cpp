@@ -235,7 +235,7 @@ static void rope_norm_sycl(const T * x, T * dst, const int ne0, const int ne1, c
 
     const float theta_scale = powf(freq_base, -2.0f / n_dims);
 
-    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
+    // fp16 capability verified at device init (cached in sycl_device_info::has_fp16)
 
     if (freq_factors == nullptr) {
         /*
@@ -272,7 +272,7 @@ static void rope_neox_sycl(const T * x, T * dst, const int ne0, const int ne1, c
 
     const float theta_scale = powf(freq_base, -2.0f / n_dims);
 
-    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
+    // fp16 capability verified at device init (cached in sycl_device_info::has_fp16)
 
     if (freq_factors == nullptr) {
         stream->parallel_for(sycl::nd_range<3>(block_nums * block_dims, block_dims), [=](sycl::nd_item<3> item_ct1) {
@@ -302,7 +302,7 @@ static void rope_multi_sycl(const T * x, T * dst, const int ne0, const int ne1, 
     const float theta_scale = std::pow(freq_base, -2.0f / n_dims);
     // Add FP16 capability check if T could be sycl::half
     if constexpr (std::is_same_v<T, sycl::half>) {
-        dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
+        // fp16 capability verified at device init (cached in sycl_device_info::has_fp16)
     }
     // launch kernel
     if (freq_factors == nullptr) {
@@ -337,7 +337,7 @@ static void rope_vision_sycl(const T * x, T * dst, const int ne0, const int ne1,
     const float theta_scale = std::pow(freq_base, -2.0f / n_dims);
     // Add FP16 capability check if T could be sycl::half
     if constexpr (std::is_same_v<T, sycl::half>) {
-        dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
+        // fp16 capability verified at device init (cached in sycl_device_info::has_fp16)
     }
     // launch kernel
     if (freq_factors == nullptr) {

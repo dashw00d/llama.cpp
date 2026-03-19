@@ -539,9 +539,9 @@ static void reorder_mul_mat_vec_q4_0_q8_1_sycl(const void * vx, const void * vy,
     GGML_ASSERT(ncols % QK4_0 == 0);
     const int        block_num_y   = ceil_div(nrows, GGML_SYCL_MMV_Y);
     constexpr size_t num_subgroups = 16;
-    GGML_ASSERT(block_num_y % num_subgroups == 0);
+    const int block_num_y_padded = ceil_div(block_num_y, (int)num_subgroups) * num_subgroups;
 
-    const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, (block_num_y * WARP_SIZE));
+    const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, (block_num_y_padded * WARP_SIZE));
     const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
 
     stream->submit([&](sycl::handler & cgh) {
@@ -764,9 +764,9 @@ static void reorder_mul_mat_vec_q4_k_q8_1_sycl(const void * vx, const void * vy,
 
     const int block_num_y = ceil_div(nrows, GGML_SYCL_MMV_Y);
     constexpr size_t num_subgroups = 16;
-    GGML_ASSERT(block_num_y % num_subgroups == 0);
+    const int block_num_y_padded = ceil_div(block_num_y, (int)num_subgroups) * num_subgroups;
 
-    const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, block_num_y * WARP_SIZE);
+    const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, block_num_y_padded * WARP_SIZE);
     const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
 
     stream->submit([&](sycl::handler & cgh) {
@@ -808,9 +808,9 @@ static void reorder_mul_mat_vec_q6_k_q8_1_sycl(const void * vx, const void * vy,
     GGML_ASSERT(ncols % QK_K == 0);
     const int        block_num_y   = ceil_div(nrows, GGML_SYCL_MMV_Y);
     constexpr size_t num_subgroups = 16;
-    GGML_ASSERT(block_num_y % num_subgroups == 0);
+    const int block_num_y_padded = ceil_div(block_num_y, (int)num_subgroups) * num_subgroups;
 
-    const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, block_num_y * WARP_SIZE);
+    const sycl::range<3> global_size(1, GGML_SYCL_MMV_Y, block_num_y_padded * WARP_SIZE);
     const sycl::range<3> workgroup_size(1, GGML_SYCL_MMV_Y, num_subgroups * WARP_SIZE);
 
     stream->submit([&](sycl::handler & cgh) {
@@ -1153,4 +1153,53 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
     GGML_UNUSED(dst);
     GGML_UNUSED(src1_ddf_i);
     GGML_UNUSED(ctx);
+}
+
+// Resolve inner MMVQ kernel launcher by quantization type.
+// This eliminates the type switch from the per-expert hot loop in MoE dispatch.
+mmvq_kernel_fn_t get_mmvq_kernel(ggml_type type, bool use_reorder) {
+    switch (type) {
+        case GGML_TYPE_Q4_0:
+            return use_reorder ? reorder_mul_mat_vec_q4_0_q8_1_sycl : mul_mat_vec_q4_0_q8_1_sycl;
+        case GGML_TYPE_Q4_1:
+            return mul_mat_vec_q4_1_q8_1_sycl;
+        case GGML_TYPE_Q5_0:
+            return mul_mat_vec_q5_0_q8_1_sycl;
+        case GGML_TYPE_Q5_1:
+            return mul_mat_vec_q5_1_q8_1_sycl;
+        case GGML_TYPE_Q8_0:
+            return mul_mat_vec_q8_0_q8_1_sycl;
+        case GGML_TYPE_Q2_K:
+            return mul_mat_vec_q2_K_q8_1_sycl;
+        case GGML_TYPE_Q3_K:
+            return mul_mat_vec_q3_K_q8_1_sycl;
+        case GGML_TYPE_Q4_K:
+            return use_reorder ? reorder_mul_mat_vec_q4_k_q8_1_sycl : mul_mat_vec_q4_K_q8_1_sycl;
+        case GGML_TYPE_Q5_K:
+            return mul_mat_vec_q5_K_q8_1_sycl;
+        case GGML_TYPE_Q6_K:
+            return use_reorder ? reorder_mul_mat_vec_q6_k_q8_1_sycl : mul_mat_vec_q6_K_q8_1_sycl;
+        case GGML_TYPE_IQ1_S:
+            return mul_mat_vec_iq1_s_q8_1_sycl;
+        case GGML_TYPE_IQ1_M:
+            return mul_mat_vec_iq1_m_q8_1_sycl;
+        case GGML_TYPE_IQ2_XXS:
+            return mul_mat_vec_iq2_xxs_q8_1_sycl;
+        case GGML_TYPE_IQ2_XS:
+            return mul_mat_vec_iq2_xs_q8_1_sycl;
+        case GGML_TYPE_IQ2_S:
+            return mul_mat_vec_iq2_s_q8_1_sycl;
+        case GGML_TYPE_IQ3_XXS:
+            return mul_mat_vec_iq3_xxs_q8_1_sycl;
+        case GGML_TYPE_IQ3_S:
+            return mul_mat_vec_iq3_s_q8_1_sycl;
+        case GGML_TYPE_IQ4_NL:
+            return mul_mat_vec_iq4_nl_q8_1_sycl;
+        case GGML_TYPE_IQ4_XS:
+            return mul_mat_vec_iq4_xs_q8_1_sycl;
+        case GGML_TYPE_MXFP4:
+            return mul_mat_vec_mxfp4_q8_1_sycl;
+        default:
+            return nullptr;
+    }
 }

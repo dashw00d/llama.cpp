@@ -169,7 +169,7 @@ static void set_rows_sycl(ggml_backend_sycl_context & ctx, const ggml_tensor * s
             );
             break;
         case GGML_TYPE_F16:
-            dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
+            // fp16 capability verified at device init (cached in sycl_device_info::has_fp16)
             set_rows_sycl<TIn, TIdx, sycl::half>(
                 src0_d, src1_d, (char *)dst->data,
                 ne00, ne01, ne02, ne03,

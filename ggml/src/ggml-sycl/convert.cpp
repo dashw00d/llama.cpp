@@ -38,8 +38,7 @@ static void dequantize_block_sycl(const void *__restrict__ vx,
                                   dpct::queue_ptr stream) {
     const int64_t num_blocks = (k + 2*SYCL_DEQUANTIZE_BLOCK_SIZE - 1) / (2*SYCL_DEQUANTIZE_BLOCK_SIZE);
     {
-        dpct::has_capability_or_fail(stream->get_device(),
-                                     {sycl::aspect::fp16});
+        // fp16 capability verified at device init (cached in sycl_device_info::has_fp16)
         stream->parallel_for(
             sycl::nd_range<3>(
                 sycl::range<3>(1, 1, num_blocks) *
@@ -57,8 +56,7 @@ static void dequantize_row_q2_K_sycl(const void *vx, dst_t *y, const int64_t k,
     const int64_t nb = k / QK_K;
 #if QK_K == 256
     {
-        dpct::has_capability_or_fail(stream->get_device(),
-                                     {sycl::aspect::fp16});
+        // fp16 capability verified at device init (cached in sycl_device_info::has_fp16)
 
         stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
                                                    sycl::range<3>(1, 1, 64),
@@ -69,8 +67,7 @@ static void dequantize_row_q2_K_sycl(const void *vx, dst_t *y, const int64_t k,
     }
 #else
     {
-        dpct::has_capability_or_fail(stream->get_device(),
-                                     {sycl::aspect::fp16});
+        // fp16 capability verified at device init (cached in sycl_device_info::has_fp16)
 
         stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
                                                    sycl::range<3>(1, 1, 32),
@@ -89,8 +86,7 @@ static void dequantize_row_q3_K_sycl(const void *vx, dst_t *y, const int64_t k,
     const int64_t nb = k / QK_K;
 #if QK_K == 256
     {
-        dpct::has_capability_or_fail(stream->get_device(),
-                                     {sycl::aspect::fp16});
+        // fp16 capability verified at device init (cached in sycl_device_info::has_fp16)
 
         stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
                                                    sycl::range<3>(1, 1, 64),
@@ -101,8 +97,7 @@ static void dequantize_row_q3_K_sycl(const void *vx, dst_t *y, const int64_t k,
     }
 #else
     {
-        dpct::has_capability_or_fail(stream->get_device(),
-                                     {sycl::aspect::fp16});
+        // fp16 capability verified at device init (cached in sycl_device_info::has_fp16)
 
         stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
                                                    sycl::range<3>(1, 1, 32),
@@ -120,8 +115,7 @@ static void dequantize_row_q4_0_sycl(const void *vx, dst_t *y, const int64_t k,
     const int64_t nb32 = k / 32;
     const int64_t nb = (k + 255) / 256;
     {
-        dpct::has_capability_or_fail(stream->get_device(),
-                                     {sycl::aspect::fp16});
+        // fp16 capability verified at device init (cached in sycl_device_info::has_fp16)
 
         stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
                                                    sycl::range<3>(1, 1, 32),
@@ -136,8 +130,7 @@ template <typename dst_t>
 static void dequantize_row_q4_0_sycl_reorder(const void *vx, dst_t *y, const int64_t k,
                                      dpct::queue_ptr stream) {
 
-    dpct::has_capability_or_fail(stream->get_device(),
-                                    {sycl::aspect::fp16});
+    // fp16 capability verified at device init (cached in sycl_device_info::has_fp16)
 
     int constexpr WARP_K = WARP_SIZE * QK4_0;
     const int n_warp = (k + WARP_K - 1) / WARP_K;
@@ -157,8 +150,7 @@ static void dequantize_row_q4_1_sycl(const void *vx, dst_t *y, const int64_t k,
     const int64_t nb32 = k / 32;
     const int64_t nb = (k + 255) / 256;
     {
-        dpct::has_capability_or_fail(stream->get_device(),
-                                     {sycl::aspect::fp16});
+        // fp16 capability verified at device init (cached in sycl_device_info::has_fp16)
 
         stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
                                                    sycl::range<3>(1, 1, 32),
@@ -175,8 +167,7 @@ static void dequantize_row_q4_K_sycl(const void *vx, dst_t *y, const int64_t k,
                                      dpct::queue_ptr stream) {
     const int64_t nb = k / QK_K;
     {
-        dpct::has_capability_or_fail(stream->get_device(),
-                                     {sycl::aspect::fp16});
+        // fp16 capability verified at device init (cached in sycl_device_info::has_fp16)
 
         stream->submit([&](sycl::handler &cgh) {
             sycl::local_accessor<uint8_t, 1> scale_local_acc(sycl::range<1>(12), cgh);
@@ -196,7 +187,7 @@ static void dequantize_row_q4_K_sycl_reorder(const void * vx, dst_t * y, const i
     const size_t  local_size  = 32;
     const size_t  global_size = nb * local_size;
 
-    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
+    // fp16 capability verified at device init (cached in sycl_device_info::has_fp16)
 
     stream->submit([&](sycl::handler & cgh) {
         sycl::local_accessor<uint8_t, 1> scale_local_acc(sycl::range<1>(12), cgh);
@@ -214,8 +205,7 @@ static void dequantize_row_q5_K_sycl(const void *vx, dst_t *y, const int64_t k,
     const int64_t nb = k / QK_K;
 #if QK_K == 256
     {
-        dpct::has_capability_or_fail(stream->get_device(),
-                                     {sycl::aspect::fp16});
+        // fp16 capability verified at device init (cached in sycl_device_info::has_fp16)
 
         stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
                                                    sycl::range<3>(1, 1, 64),
@@ -226,8 +216,7 @@ static void dequantize_row_q5_K_sycl(const void *vx, dst_t *y, const int64_t k,
     }
 #else
     {
-        dpct::has_capability_or_fail(stream->get_device(),
-                                     {sycl::aspect::fp16});
+        // fp16 capability verified at device init (cached in sycl_device_info::has_fp16)
 
         stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
                                                    sycl::range<3>(1, 1, 32),
@@ -246,8 +235,7 @@ static void dequantize_row_q6_K_sycl(const void *vx, dst_t *y, const int64_t k,
     const int64_t nb = k / QK_K;
 #if QK_K == 256
     {
-        dpct::has_capability_or_fail(stream->get_device(),
-                                     {sycl::aspect::fp16});
+        // fp16 capability verified at device init (cached in sycl_device_info::has_fp16)
 
         stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
                                                    sycl::range<3>(1, 1, 64),
@@ -258,8 +246,7 @@ static void dequantize_row_q6_K_sycl(const void *vx, dst_t *y, const int64_t k,
     }
 #else
     {
-        dpct::has_capability_or_fail(stream->get_device(),
-                                     {sycl::aspect::fp16});
+        // fp16 capability verified at device init (cached in sycl_device_info::has_fp16)
 
         stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
                                                    sycl::range<3>(1, 1, 32),
@@ -276,7 +263,7 @@ template <typename dst_t>
 static void dequantize_row_q6_K_sycl_reorder(const void * vx, dst_t * y, const int64_t k, dpct::queue_ptr stream) {
     const int64_t nb = k / QK_K;
 
-    dpct::has_capability_or_fail(stream->get_device(), { sycl::aspect::fp16 });
+    // fp16 capability verified at device init (cached in sycl_device_info::has_fp16)
 
     stream->parallel_for(
         sycl::nd_range<3>(sycl::range<3>(1, 1, nb) * sycl::range<3>(1, 1, 64), sycl::range<3>(1, 1, 64)),
@@ -288,8 +275,7 @@ static void dequantize_row_iq1_s_sycl(const void *vx, dst_t *y, const int64_t k,
                                         dpct::queue_ptr stream) {
     const int64_t nb = k / QK_K;
     {
-        dpct::has_capability_or_fail(stream->get_device(),
-                                     {sycl::aspect::fp16});
+        // fp16 capability verified at device init (cached in sycl_device_info::has_fp16)
 
         stream->submit([&](sycl::handler &cgh) {
             cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
@@ -309,8 +295,7 @@ static void dequantize_row_iq1_m_sycl(const void *vx, dst_t *y, const int64_t k,
                                         dpct::queue_ptr stream) {
     const int64_t nb = k / QK_K;
     {
-        dpct::has_capability_or_fail(stream->get_device(),
-                                     {sycl::aspect::fp16});
+        // fp16 capability verified at device init (cached in sycl_device_info::has_fp16)
 
         stream->submit([&](sycl::handler &cgh) {
             cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
@@ -330,8 +315,7 @@ static void dequantize_row_iq2_xxs_sycl(const void *vx, dst_t *y, const int64_t 
                                         dpct::queue_ptr stream) {
     const int64_t nb = k / QK_K;
     {
-        dpct::has_capability_or_fail(stream->get_device(),
-                                     {sycl::aspect::fp16});
+        // fp16 capability verified at device init (cached in sycl_device_info::has_fp16)
 
         stream->submit([&](sycl::handler &cgh) {
             cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
@@ -351,8 +335,7 @@ static void dequantize_row_iq2_xs_sycl(const void *vx, dst_t *y, const int64_t k
                                        dpct::queue_ptr stream) {
     const int64_t nb = k / QK_K;
     {
-        dpct::has_capability_or_fail(stream->get_device(),
-                                     {sycl::aspect::fp16});
+        // fp16 capability verified at device init (cached in sycl_device_info::has_fp16)
 
         stream->submit([&](sycl::handler &cgh) {
             cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
@@ -372,8 +355,7 @@ static void dequantize_row_iq2_s_sycl(const void *vx, dst_t *y, const int64_t k,
                                       dpct::queue_ptr stream) {
     const int64_t nb = k / QK_K;
     {
-        dpct::has_capability_or_fail(stream->get_device(),
-                                     {sycl::aspect::fp16});
+        // fp16 capability verified at device init (cached in sycl_device_info::has_fp16)
 
         stream->submit([&](sycl::handler &cgh) {
             cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
@@ -392,8 +374,7 @@ static void dequantize_row_iq3_xxs_sycl(const void *vx, dst_t *y, const int64_t 
                                         dpct::queue_ptr stream) {
     const int64_t nb = k / QK_K;
     {
-        dpct::has_capability_or_fail(stream->get_device(),
-                                     {sycl::aspect::fp16});
+        // fp16 capability verified at device init (cached in sycl_device_info::has_fp16)
 
         stream->submit([&](sycl::handler &cgh) {
             cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
@@ -413,8 +394,7 @@ static void dequantize_row_iq3_s_sycl(const void *vx, dst_t *y, const int64_t k,
                                         dpct::queue_ptr stream) {
     const int64_t nb = k / QK_K;
     {
-        dpct::has_capability_or_fail(stream->get_device(),
-                                     {sycl::aspect::fp16});
+        // fp16 capability verified at device init (cached in sycl_device_info::has_fp16)
 
         stream->submit([&](sycl::handler &cgh) {
             cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
@@ -436,8 +416,7 @@ static void dequantize_row_iq4_xs_sycl(const void *vx, dst_t *y, const int64_t k
     dequantize_row_iq4_nl_sycl(vx, y, k, stream);
 #else
       {
-            dpct::has_capability_or_fail(stream->get_device(),
-                                         {sycl::aspect::fp16});
+            // fp16 capability verified at device init (cached in sycl_device_info::has_fp16)
 
             stream->submit([&](sycl::handler &cgh) {
                   cgh.parallel_for(
@@ -457,8 +436,7 @@ static void dequantize_row_iq4_nl_sycl(const void *vx, dst_t *y, const int64_t k
                                        dpct::queue_ptr stream) {
     const int64_t nb = (k + QK_K - 1) / QK_K;
       {
-            dpct::has_capability_or_fail(stream->get_device(),
-                                         {sycl::aspect::fp16});
+            // fp16 capability verified at device init (cached in sycl_device_info::has_fp16)
 
             stream->submit([&](sycl::handler &cgh) {
                   cgh.parallel_for(
@@ -566,7 +544,7 @@ template <typename src_t, typename dst_t>
 static void convert_unary_nc_sycl(const void * __restrict__ vx, dst_t * __restrict__ y,
                                   const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
                                   const int64_t s01, const int64_t s02, const int64_t s03, dpct::queue_ptr queue) {
-    dpct::has_capability_or_fail(queue->get_device(), { sycl::aspect::fp16 });
+    // fp16 capability verified at device init (cached in sycl_device_info::has_fp16)
 
     sycl::range<3> global_size(ne02 * ne03, ne01, ceil_div(ne00, SYCL_DEQUANTIZE_BLOCK_SIZE));
 

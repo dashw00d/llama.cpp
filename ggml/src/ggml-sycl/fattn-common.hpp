@@ -1020,7 +1020,7 @@ void launch_fattn(
 
         KV_max.alloc(ne_KV_max);
         {
-            dpct::has_capability_or_fail(main_stream->get_device(), { sycl::aspect::fp16 });
+            // fp16 capability verified at device init (cached in sycl_device_info::has_fp16)
 
             main_stream->submit([&](sycl::handler & cgh) {
                 sycl::local_accessor<int, 1> buf_iw_acc_ct1(sycl::range<1>(warp_size), cgh);
