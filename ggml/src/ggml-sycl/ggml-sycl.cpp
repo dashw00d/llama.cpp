@@ -4326,6 +4326,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             src1_row.data = src1_original + i11*nb11 + i12*nb12;
             dst_row.data = dst_original + i1*nb1 + i2*nb2;
 
+            // Invalidate q8 cache: with broadcast (ne11=1), multiple experts share
+            // the same src1 data pointer but src0 differs. The cache would return
+            // correct q8 data in this case (same src1 content). However, invalidate
+            // defensively since different experts may produce different dst shapes.
+            ctx.invalidate_q8_cache();
+
             ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row);
             }
         }
@@ -4426,6 +4432,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             dst_row.nb[1] = nb1;
             dst_row.nb[2] = num_src1_rows*nb1;
             dst_row.nb[3] = num_src1_rows*nb1;
+
+            // Invalidate q8 cache: src1_contiguous buffer is reused across experts
+            // with different content (gathered by k_copy_src1_to_contiguous), but the
+            // pointer stays the same. The q8 cache keys on pointer + shape, so it would
+            // incorrectly return stale quantized data from a previous expert's src1.
+            ctx.invalidate_q8_cache();
 
             ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row);
 
