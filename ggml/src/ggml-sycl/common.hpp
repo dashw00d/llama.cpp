@@ -325,6 +325,61 @@ struct ggml_backend_sycl_context {
 
     queue_ptr qptrs[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS] = { { nullptr } };
 
+    // ── Quantization cache: reuse q8_1-quantized src1 across MUL_MATs ──
+    // When multiple MUL_MAT ops (e.g., Q/K/V projections) share the same src1
+    // (same data pointer, dimensions), the quantize_q8_1 kernel runs redundantly.
+    // This cache stores the last quantized buffer so subsequent calls can skip it.
+    // Saves ~2 kernel launches per attention layer (Q/K/V share src1) and ~1 per
+    // MoE layer (gate/up share src1).
+    struct {
+        const void * src1_data = nullptr;   // src1->data at quantize time
+        int64_t ne10 = 0;                   // src1->ne[0]
+        int64_t nrows1 = 0;                 // ggml_nrows(src1)
+        int64_t padded_col_size = 0;        // GGML_PAD(ne10, MATRIX_ROW_PADDING)
+        int     quant_format = 0;           // 0=standard q8_1, 1=reordered SoA
+        void *  q8_buf = nullptr;           // device pointer to cached q8_1 data (sycl::malloc_device)
+        size_t  q8_buf_size = 0;            // allocated size in bytes
+        size_t  q8_data_size = 0;           // actual data size (may be <= q8_buf_size)
+    } q8_cache;
+
+    void invalidate_q8_cache() {
+        q8_cache.src1_data = nullptr;
+    }
+
+    // Check if quantized src1 is cached (same data pointer + dimensions + format)
+    bool q8_cache_hit(const void * src1_data, int64_t ne10, int64_t nrows1,
+                      int64_t padded_col_size, int quant_format) const {
+        return q8_cache.src1_data == src1_data
+            && q8_cache.ne10 == ne10
+            && q8_cache.nrows1 == nrows1
+            && q8_cache.padded_col_size == padded_col_size
+            && q8_cache.quant_format == quant_format
+            && q8_cache.q8_buf != nullptr;
+    }
+
+    // Get or allocate the q8 cache buffer (grows as needed, never shrinks)
+    void * q8_cache_alloc(size_t nbytes) {
+        if (nbytes > q8_cache.q8_buf_size) {
+            if (q8_cache.q8_buf) {
+                sycl::free(q8_cache.q8_buf, stream()->get_context());
+            }
+            q8_cache.q8_buf = sycl::malloc_device(nbytes, *stream());
+            q8_cache.q8_buf_size = q8_cache.q8_buf ? nbytes : 0;
+        }
+        return q8_cache.q8_buf;
+    }
+
+    // Store cache metadata after a successful quantization
+    void q8_cache_store(const void * src1_data, int64_t ne10, int64_t nrows1,
+                        int64_t padded_col_size, int quant_format, size_t data_size) {
+        q8_cache.src1_data = src1_data;
+        q8_cache.ne10 = ne10;
+        q8_cache.nrows1 = nrows1;
+        q8_cache.padded_col_size = padded_col_size;
+        q8_cache.quant_format = quant_format;
+        q8_cache.q8_data_size = data_size;
+    }
+
     // Pre-allocated pinned staging buffer for cross-device copies.
     // Grows as needed, never shrinks. One per context (per device).
     void *  staging_buf      = nullptr;
@@ -351,6 +406,10 @@ struct ggml_backend_sycl_context {
         if (ids_pinned_buf && staging_ctx_valid) {
             sycl::free(ids_pinned_buf, staging_sycl_ctx);
             ids_pinned_buf = nullptr;
+        }
+        if (q8_cache.q8_buf && staging_ctx_valid) {
+            sycl::free(q8_cache.q8_buf, staging_sycl_ctx);
+            q8_cache.q8_buf = nullptr;
         }
     }
 
@@ -499,12 +558,26 @@ struct ggml_backend_sycl_context {
                                 // 0 = stable (use graph replay)
                                 // 1 = first mismatch (re-record once to check)
                                 // >=2 = unstable (skip graphs, direct dispatch)
+        uint64_t last_used = 0; // monotonic counter for LRU eviction
     };
     std::unordered_map<uint64_t, graph_cache_entry> graph_cache;
+    uint64_t graph_cache_access_counter = 0; // monotonic counter for LRU tracking
+    static constexpr int GRAPH_CACHE_MAX_SIZE = 100; // DG2/Arc limit ~127 exec graphs per device
+    // Recording budget: limits how many NEW graph recordings happen per
+    // graph_compute call. Set high (999) so all segments compile in one pass.
+    // First-token compilation cost is acceptable (~73ms/seg × N segments).
+    // Budget kept as safety mechanism; replenished by 1 each graph_compute call.
+    static constexpr int GRAPH_RECORD_BUDGET_MAX = 999;
+    int graph_record_budget = GRAPH_RECORD_BUDGET_MAX;
     // Set to true while inside begin_recording()/end_recording() so that
     // kernel dispatch paths can avoid host-synchronizing library calls
     // (e.g. oneMKL gemm) that are incompatible with SYCL command graph recording.
     bool graph_recording = false;
+    // Per-graph_compute timing counters (reset each call)
+    int graph_seg_replayed  = 0;
+    int graph_seg_recorded  = 0;
+    int graph_seg_direct    = 0;
+    double graph_total_ms   = 0.0;
 #endif
 
     ggml_sycl_pool & host_pool(int device) {

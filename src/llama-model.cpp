@@ -48,9 +48,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     // const std::regex pattern_qkv_weight("blk\\.\\d*\\.attn_qkv.weight");
     // const std::regex pattern_attn_gate_weight("blk\\.\\d*\\.attn_gate.weight");
 
-    const std::regex pattern_ffn_up_gate_weight("blk\\.\\d*\\.ffn_(up|gate)(_exps)?.weight");
-    const std::regex pattern_ffn_up_gate_bias("blk\\.\\d*\\.ffn_(up|gate)(_exps)?.bias");
-    const std::regex pattern_ffn_down_weight("blk\\.\\d*\\.ffn_down(_exps)?.weight");
+    // EP: expert tensors split on expert dimension (axis 2) — must match BEFORE non-_exps patterns
+    const std::regex pattern_ffn_up_gate_exps_weight("blk\\.\\d*\\.ffn_(up|gate|gate_up)_exps.weight");
+    const std::regex pattern_ffn_down_exps_weight("blk\\.\\d*\\.ffn_down_exps.weight");
+    const std::regex pattern_ffn_up_gate_exps_bias("blk\\.\\d*\\.ffn_(up|gate|gate_up)_exps.bias");
+
+    // TP: non-expert FFN tensors keep original split axes
+    const std::regex pattern_ffn_up_gate_weight("blk\\.\\d*\\.ffn_(up|gate).weight");
+    const std::regex pattern_ffn_up_gate_bias("blk\\.\\d*\\.ffn_(up|gate).bias");
+    const std::regex pattern_ffn_down_weight("blk\\.\\d*\\.ffn_down.weight");
     const std::regex pattern_ffn_down_bias("blk\\.\\d*\\.ffn_down.bias");
     const std::regex pattern_ffn_down_exps_bias("blk\\.\\d*\\.ffn_down_exps.bias");
     const std::regex pattern_output_weight("output\\.weight");
@@ -117,21 +123,33 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         //     return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
         // }
 
-        // FFN
+        // EP: Expert tensors — split on expert dimension (axis 2)
+        // Must match BEFORE non-_exps patterns below
+        if (std::regex_match(tensor_name, pattern_ffn_up_gate_exps_weight)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+        }
+        if (std::regex_match(tensor_name, pattern_ffn_down_exps_weight)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+        }
+        if (std::regex_match(tensor_name, pattern_ffn_up_gate_exps_bias)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+        }
+        if (std::regex_match(tensor_name, pattern_ffn_down_exps_bias)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+        }
+
+        // TP: Non-expert FFN tensors — split on weight dimensions
         if (std::regex_match(tensor_name, pattern_ffn_up_gate_weight)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down.weight", "ffn_down_exps.weight");
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down.weight");
         }
         if (std::regex_match(tensor_name, pattern_ffn_up_gate_bias)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down.weight", "ffn_down_exps.weight");
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down.weight");
         }
         if (std::regex_match(tensor_name, pattern_ffn_down_weight)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down.weight", "ffn_down_exps.weight");
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down.weight");
         }
         if (std::regex_match(tensor_name, pattern_ffn_down_bias)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-        }
-        if (std::regex_match(tensor_name, pattern_ffn_down_exps_bias)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_PARTIAL);
         }
 
         // output
@@ -168,7 +186,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return std::lcm(n_embd_q, blck_size)/n_embd_q * n_gqa;
         }
 
-        // FFN
+        // EP: Expert tensors split on expert dimension — granularity 1 (each expert is independent)
+        if (std::regex_match(tensor_name, pattern_ffn_up_gate_exps_weight) ||
+                std::regex_match(tensor_name, pattern_ffn_down_exps_weight) ||
+                std::regex_match(tensor_name, pattern_ffn_up_gate_exps_bias) ||
+                std::regex_match(tensor_name, pattern_ffn_down_exps_bias)) {
+            return 1;
+        }
+
+        // TP: Non-expert FFN tensors
         if (std::regex_match(tensor_name, pattern_ffn_up_gate_weight) || std::regex_match(tensor_name, pattern_ffn_up_gate_bias) ||
                 std::regex_match(tensor_name, pattern_ffn_down_weight)) {
             return blck_size;

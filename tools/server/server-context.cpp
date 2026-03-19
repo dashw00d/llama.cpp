@@ -536,6 +536,10 @@ public:
     server_queue    queue_tasks;
     server_response queue_results;
 
+    // readiness tracking: set to true after the first successful inference completes
+    // this indicates SYCL graphs have been compiled for real workload sizes
+    mutable std::atomic<bool> has_completed_inference{false};
+
     // note: chat_params must not be refreshed upon existing sleeping state
     server_chat_params chat_params;
 
@@ -1439,6 +1443,12 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
+        // mark that at least one inference has completed (SYCL graphs compiled for real sizes)
+        if (!has_completed_inference.load(std::memory_order_relaxed)) {
+            has_completed_inference.store(true, std::memory_order_release);
+            SRV_INF("%s", "first inference completed - server is fully ready\n");
+        }
+
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;
@@ -3214,7 +3224,7 @@ void server_routes::init_routes() {
     // IMPORTANT: all lambda functions must start with create_response()
     // this is to ensure that the server_res_generator can handle sleeping case correctly
 
-    this->get_health = [this](const server_http_req &) {
+    this->get_health = [this](const server_http_req & req) {
         // error and loading states are handled by middleware
         auto res = create_response(true);
 
@@ -3223,7 +3233,40 @@ void server_routes::init_routes() {
         bool ctx_server; // do NOT delete this line
         GGML_UNUSED(ctx_server);
 
-        res->ok({{"status", "ok"}});
+        // check if detail was requested via query parameter
+        std::string detail = req.get_param("detail", "false");
+        if (detail == "true" || detail == "1") {
+            bool inference_done = this->ctx_server.has_completed_inference.load(std::memory_order_acquire);
+            res->ok({
+                {"status", "ok"},
+                {"ready",  inference_done},
+                {"model_loaded", true},
+                {"first_inference_done", inference_done},
+            });
+        } else {
+            res->ok({{"status", "ok"}});
+        }
+        return res;
+    };
+
+    this->get_ready = [this](const server_http_req &) {
+        // readiness endpoint: returns 200 only when the server has completed
+        // at least one inference (SYCL graphs compiled for real workload sizes)
+        auto res = create_response(true);
+
+        bool ctx_server; // do NOT delete this line
+        GGML_UNUSED(ctx_server);
+
+        bool inference_done = this->ctx_server.has_completed_inference.load(std::memory_order_acquire);
+        if (inference_done) {
+            res->ok({{"status", "ready"}});
+        } else {
+            res->status = 503;
+            res->data = safe_json_to_str(json{
+                {"status", "warming_up"},
+                {"message", "Server is loaded but has not yet completed first inference (graph compilation may be in progress)"},
+            });
+        }
         return res;
     };
 

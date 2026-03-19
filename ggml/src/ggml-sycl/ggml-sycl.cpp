@@ -56,6 +56,10 @@
 #include "ggml-sycl/quantize.hpp"
 #include "ggml-sycl/ssm_conv.hpp"
 #include "ggml-sycl/mmvq.hpp"
+#include "ggml-sycl/fused-moe-mmvq.hpp"
+#include "ggml-sycl/fused-expert-agg.hpp"
+#include "ggml-sycl/fused-add-rmsnorm.hpp"
+#include "ggml-sycl/fused-topk-select.hpp"
 #include "ggml.h"
 
 static bool g_sycl_loaded = false;
@@ -2895,17 +2899,40 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
         }
 
         if constexpr(quantize_enabled) {
-            dev[i].src1_ddq = dev[i].src1_ddq_alloc.alloc(ctx.pool(i), nrows1*src1_padded_col_size*q8_1_ts/q8_1_bs);
+            const size_t q8_data_bytes = nrows1*src1_padded_col_size*q8_1_ts/q8_1_bs;
+            // Distinguish standard q8_1 from reordered SoA format for cache correctness
+            constexpr bool is_reorder = std::is_same_v<quantize_f<QK8_1 / WARP_SIZE>,
+                                                       quantize_and_reorder_q8_1_soa<QK8_1 / WARP_SIZE>>;
+            constexpr int quant_fmt = is_reorder ? 1 : 0;
 
-            if (src1_on_device && src1_is_contiguous) {
-                scope_op_debug_print scope_dbg_print(__func__, "/quantize_row_q8_1_sycl", dst,
-                                                     /*num_src=*/2, " : converting src1 to Q8_1");
-                try {
-                    quantize_row_q8_1_sycl<quantize_f>(dev[i].src1_ddf, dev[i].src1_ddq, ne10, nrows1, src1_padded_col_size, stream);
-                } catch (sycl::exception const &exc) {
-                    std::cerr << "Quantize_row_q8_1_sycl error" << exc.what() << "Exception caught at file:" << __FILE__
-                              << ", line:" << __LINE__ << std::endl;
-                    std::exit(1);
+            if (src1_on_device && src1_is_contiguous && !split
+                && ctx.q8_cache_hit(src1->data, ne10, nrows1, src1_padded_col_size, quant_fmt)) {
+                // Cache hit: reuse previously quantized src1 (e.g., Q/K/V share same input)
+                dev[i].src1_ddq = (char *)ctx.q8_cache.q8_buf;
+                GGML_SYCL_DEBUG("[SYCL] q8 cache HIT: src1=%p ne10=%ld nrows=%ld fmt=%d\n",
+                                src1->data, (long)ne10, (long)nrows1, quant_fmt);
+            } else {
+                dev[i].src1_ddq = dev[i].src1_ddq_alloc.alloc(ctx.pool(i), q8_data_bytes);
+
+                if (src1_on_device && src1_is_contiguous) {
+                    scope_op_debug_print scope_dbg_print(__func__, "/quantize_row_q8_1_sycl", dst,
+                                                         /*num_src=*/2, " : converting src1 to Q8_1");
+                    try {
+                        quantize_row_q8_1_sycl<quantize_f>(dev[i].src1_ddf, dev[i].src1_ddq, ne10, nrows1, src1_padded_col_size, stream);
+                    } catch (sycl::exception const &exc) {
+                        std::cerr << "Quantize_row_q8_1_sycl error" << exc.what() << "Exception caught at file:" << __FILE__
+                                  << ", line:" << __LINE__ << std::endl;
+                        std::exit(1);
+                    }
+
+                    // Store in cache for reuse by subsequent MUL_MATs with same src1
+                    if (!split) {
+                        void * cache_buf = ctx.q8_cache_alloc(q8_data_bytes);
+                        if (cache_buf) {
+                            stream->memcpy(cache_buf, dev[i].src1_ddq, q8_data_bytes);
+                            ctx.q8_cache_store(src1->data, ne10, nrows1, src1_padded_col_size, quant_fmt, q8_data_bytes);
+                        }
+                    }
                 }
             }
         }
@@ -3863,13 +3890,143 @@ struct mmid_row_mapping {
     int32_t i2;
 };
 
+// ============================================================================
+// Fused Multi-Expert MoE Dispatch (Decode Path)
+//
+// Replaces N individual kernel launches with a single fused kernel launch.
+// Also reduces D2H copy to just n_ids × 4 bytes (e.g., 16 bytes for 4 experts)
+// instead of the full ids tensor.
+//
+// Flow:
+//   1. Small D2H copy of routing IDs (just one token's worth)
+//   2. Quantize src1 to q8_1 once (shared across experts)
+//   3. Build expert pointer arrays on host
+//   4. Copy pointer arrays to device (tiny: n_ids × sizeof(ptr))
+//   5. Single fused kernel launch: all experts computed in parallel
+// ============================================================================
+static bool ggml_sycl_mul_mat_id_fused(
+    ggml_backend_sycl_context & ctx,
+    const ggml_tensor * src0,
+    const ggml_tensor * src1,
+    ggml_tensor * dst,
+    const ggml_tensor * ids,
+    const int32_t expert_offset,
+    const int64_t n_local_experts)
+{
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    // Only handle decode path (single token)
+    if (ne12 != 1) return false;
+
+    if (ggml_backend_buffer_is_sycl_split(src0->buffer)) return false;
+    if (!can_use_mul_mat_vec_q(src0, src1, dst) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) return false;
+
+    const int64_t n_ids = ids->ne[0];     // active experts per token
+
+    if (n_ids > FUSED_MOE_MAX_EXPERTS) return false;
+
+    // EP mode flag from op_params[1] (set by meta backend for all GPUs in EP mode)
+    const bool ep_flag = (dst->op_params[2] > 0);
+
+    const queue_ptr stream = ctx.stream();
+
+    // Resolve reorder state and kernel function pointer
+    opt_for_reorder(&ctx, src0, src1, dst, mul_mat_algo::MMVQ);
+    ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
+    const bool use_reorder = extra && extra->optimized_feature.reorder;
+
+    fused_moe_kernel_fn_t kernel_fn = get_fused_moe_kernel(src0->type, use_reorder);
+    if (!kernel_fn) return false;
+
+    // Quantize src1 to q8_1 ONCE — shared across all experts
+    const size_t q8_1_ts = sizeof(block_q8_1);
+    const size_t q8_1_bs = QK8_1;
+    const int64_t src1_padded_col_size = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    const int64_t src1_rows = ggml_nrows(src1);
+    const size_t src1_ddq_size = src1_rows * src1_padded_col_size * q8_1_ts / q8_1_bs;
+
+    ggml_sycl_pool_alloc<char> src1_ddq_alloc(ctx.pool(), src1_ddq_size);
+    char * src1_ddq = src1_ddq_alloc.get();
+    if (!src1_ddq) return false;
+
+    if (use_reorder) {
+        quantize_row_q8_1_sycl<quantize_and_reorder_q8_1_soa>(
+            static_cast<const float *>(src1->data), src1_ddq, ne10, src1_rows, src1_padded_col_size, stream);
+    } else {
+        quantize_row_q8_1_sycl<quantize_q8_1>(
+            static_cast<const float *>(src1->data), src1_ddq, ne10, src1_rows, src1_padded_col_size, stream);
+    }
+
+    // --- Tiny D2H copy: just one token's routing IDs ---
+    // For decode with n_ids=4: 16 bytes instead of full ids tensor
+    const char * ids_dev = (const char *) ids->data;
+    const size_t ids_copy_size = n_ids * sizeof(int32_t);
+    char * ids_host = (char *) ctx.get_ids_pinned(ids_copy_size);
+    GGML_ASSERT(ids_host);
+
+    sycl::event ids_event = stream->memcpy(ids_host, ids_dev, ids_copy_size);
+    ids_event.wait();
+
+    // Build expert pointer arrays on host, filtering for EP
+    const char * expert_ptrs[FUSED_MOE_MAX_EXPERTS];
+    float * dst_ptrs[FUSED_MOE_MAX_EXPERTS];
+    int n_local = 0;  // count of locally-owned experts actually dispatched
+
+    const char * src0_base = (const char *) src0->data;
+    char * dst_base = (char *) dst->data;
+
+    for (int64_t id = 0; id < n_ids; id++) {
+        const int32_t i02 = *(const int32_t *)(ids_host + id * sizeof(int32_t));
+
+        if (ep_flag) {
+            // EP: skip non-local experts (dst already pre-zeroed)
+            if (i02 < expert_offset || i02 >= expert_offset + n_local_experts) {
+                continue;
+            }
+            // Remap global expert ID to local index
+            const int32_t local_idx = i02 - expert_offset;
+            expert_ptrs[n_local] = src0_base + local_idx * nb02;
+        } else {
+            GGML_ASSERT(i02 >= 0 && i02 < ne02);
+            expert_ptrs[n_local] = src0_base + i02 * nb02;
+        }
+        dst_ptrs[n_local] = (float *)(dst_base + id * nb1);
+        n_local++;
+    }
+
+    if (n_local == 0) {
+        // No locally-owned experts active — output stays zero from pre-zeroing
+        return true;
+    }
+
+    // Allocate device-side pointer arrays and copy
+    ggml_sycl_pool_alloc<const char *> dev_expert_ptrs_alloc(ctx.pool(), n_local);
+    ggml_sycl_pool_alloc<float *>      dev_dst_ptrs_alloc(ctx.pool(), n_local);
+
+    const char ** dev_expert_ptrs = dev_expert_ptrs_alloc.get();
+    float **      dev_dst_ptrs    = dev_dst_ptrs_alloc.get();
+
+    stream->memcpy(dev_expert_ptrs, expert_ptrs, n_local * sizeof(const char *));
+    stream->memcpy(dev_dst_ptrs,    dst_ptrs,    n_local * sizeof(float *));
+
+    // Single fused kernel launch for locally-owned experts only
+    const int ncols = static_cast<int>(ne00);
+    const int nrows = static_cast<int>(ne01);
+
+    kernel_fn(dev_expert_ptrs, src1_ddq, dev_dst_ptrs, ncols, nrows, n_local, stream);
+
+    return true;
+}
+
 static bool ggml_sycl_mul_mat_id_decode_fast_path(
         ggml_backend_sycl_context & ctx,
         const ggml_tensor * src0,
         const ggml_tensor * src1,
         ggml_tensor * dst,
         const ggml_tensor * ids,
-        const char * ids_host_ptr) {
+        const char * ids_host_ptr,
+        const int32_t expert_offset,
+        const int64_t n_local_experts) {
     if (ggml_backend_buffer_is_sycl_split(src0->buffer)) {
         return false;
     }
@@ -3880,7 +4037,6 @@ static bool ggml_sycl_mul_mat_id_decode_fast_path(
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
-    const int64_t n_as = ne02;
     const int64_t n_ids = ids->ne[0];
     const int64_t src1_rows = ggml_nrows(src1);
     const size_t q8_1_ts = sizeof(block_q8_1);
@@ -3889,6 +4045,9 @@ static bool ggml_sycl_mul_mat_id_decode_fast_path(
     const size_t src1_ddq_size = src1_rows * src1_padded_col_size * q8_1_ts / q8_1_bs;
 
     const queue_ptr stream = ctx.stream();
+
+    // EP mode flag from op_params[1] (set by meta backend for all GPUs in EP mode)
+    const bool ep_flag = (dst->op_params[2] > 0);
 
     // Resolve reorder state and kernel function pointer ONCE for all experts.
     // All experts share the same quantization type and dimensions — only
@@ -3927,14 +4086,25 @@ static bool ggml_sycl_mul_mat_id_decode_fast_path(
     for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
         for (int64_t id = 0; id < n_ids; ++id) {
             const int32_t i02 = *(const int32_t *) (ids_host_ptr + iid1*ids->nb[1] + id*ids->nb[0]);
-            GGML_ASSERT(i02 >= 0 && i02 < n_as);
+
+            if (ep_flag) {
+                // EP: skip non-local experts (dst already pre-zeroed)
+                if (i02 < expert_offset || i02 >= expert_offset + n_local_experts) {
+                    continue;
+                }
+            } else {
+                GGML_ASSERT(i02 >= 0 && i02 < ne02);
+            }
+
+            // Remap to local expert index for EP, or use global index for TP
+            const int32_t local_i02 = ep_flag ? (i02 - expert_offset) : i02;
 
             const int64_t i11 = id % ne11;
             const int64_t i12 = iid1;
             const int64_t src1_row_index = i12*ne11 + i11;
             const size_t src1_ddq_offset = src1_row_index * src1_padded_col_size * q8_1_ts / q8_1_bs;
 
-            const char * src0_expert = (const char *) src0->data + i02*nb02;
+            const char * src0_expert = (const char *) src0->data + local_i02*nb02;
             float * dst_expert = (float *)((char *) dst->data + id*nb1 + i12*nb2);
 
             // Direct kernel call — bypasses full ggml_sycl_mul_mat() dispatch
@@ -4017,8 +4187,39 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
 
     const queue_ptr stream = ctx.stream();
 
-    const int64_t n_as = ne02;
+    const int64_t n_as = ne02;           // number of experts in local tensor (may be < total with EP)
     const int64_t n_ids = ids->ne[0];
+
+    // --- EP (Expert Parallelism) parameters ---
+    // op_params[0]: expert_offset — the global expert ID corresponding to local index 0
+    //               Set by meta backend when src0 is SPLIT_AXIS_2 (expert-parallel).
+    //               0 means either non-EP mode or GPU0 (both handled identically).
+    // n_local_experts: ne02 = number of experts in this GPU's weight tensor.
+    //               In EP mode: ~32 (96/3). In TP mode: all experts (96).
+    const int32_t expert_offset    = dst->op_params[1];
+    const int64_t n_local_experts  = ne02;
+    // EP mode flag: op_params[1] is set to 1 by the meta backend for all GPUs
+    // when expert tensors use SPLIT_AXIS_2 (expert parallelism).
+    // This is needed because GPU0 has expert_offset=0 which is indistinguishable
+    // from non-EP mode without an explicit flag.
+    const bool    ep_flag          = (dst->op_params[2] > 0); // n_local_experts > 0 means EP mode
+
+    // --- Pre-zero output for EP mode ---
+    // Non-owned expert output slots must be zero for correct AllReduce SUM.
+    // In non-EP mode this is a no-op cost we skip entirely.
+    if (ep_flag) {
+        SYCL_CHECK(CHECK_TRY_ERROR(
+            stream->memset(dst->data, 0, ggml_nbytes(dst))));
+    }
+
+    // --- FUSED MOE FAST PATH ---
+    // Try the fused multi-expert kernel first (decode path only).
+    // This replaces N individual kernel launches with a single fused launch
+    // and only does a tiny D2H copy (n_ids × 4 bytes instead of full ids tensor).
+    if (ne12 == 1 && ggml_sycl_mul_mat_id_fused(ctx, src0, src1, dst, ids,
+                                                  expert_offset, n_local_experts)) {
+        return;
+    }
 
     const size_t ids_nbytes = ggml_nbytes(ids);
     const char * ids_dev = (const char *) ids->data;
@@ -4068,9 +4269,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         }
     }
 
-    if (ne12 == 1 && ggml_sycl_mul_mat_id_decode_fast_path(ctx, src0, src1, dst, ids, ids_host_ptr)) {
+    if (ne12 == 1 && ggml_sycl_mul_mat_id_decode_fast_path(ctx, src0, src1, dst, ids, ids_host_ptr,
+                                                             expert_offset, n_local_experts)) {
         return;
     }
+
+    // --- GENERAL BATCH PATH (ne12 > 1 or fast paths failed) ---
 
     ggml_tensor src0_row = *src0;
     ggml_tensor src1_row = *src1;
@@ -4099,7 +4303,18 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
             for (int64_t id = 0; id < n_ids; id++) {
                 const int32_t i02 = *(const int32_t *) (ids_host_ptr + iid1*ids->nb[1] + id*ids->nb[0]);
-                GGML_ASSERT(i02 >= 0 && i02 < n_as);
+
+                if (ep_flag) {
+                    // EP: skip non-local experts (dst already pre-zeroed)
+                    if (i02 < expert_offset || i02 >= expert_offset + n_local_experts) {
+                        continue;
+                    }
+                } else {
+                    GGML_ASSERT(i02 >= 0 && i02 < n_as);
+                }
+
+                // Remap to local expert index for EP, or use global index for TP
+                const int32_t local_i02 = ep_flag ? (i02 - expert_offset) : i02;
 
                 const int64_t i11 = id % ne11;
                 const int64_t i12 = iid1;
@@ -4107,7 +4322,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                 const int64_t i1 = id;
                 const int64_t i2 = i12;
 
-            src0_row.data = src0_original + i02*nb02;
+            src0_row.data = src0_original + local_i02*nb02;
             src1_row.data = src1_original + i11*nb11 + i12*nb12;
             dst_row.data = dst_original + i1*nb1 + i2*nb2;
 
@@ -4115,29 +4330,46 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             }
         }
     } else {
+        // Batch path: multiple tokens per expert.
+        // In EP mode, we iterate only over locally-owned experts.
+        // The expert_token_counts array uses LOCAL indices in EP mode.
+
+        // For the GPU-side k_copy_src1_to_contiguous kernel, we need to remap
+        // global expert IDs to local indices. In EP mode, we pass the local
+        // expert index to the kernel and remap on the host side.
+
         ggml_sycl_pool_alloc<char> src1_contiguous(ctx.pool(), sizeof(float)*ggml_nelements(src1));
         ggml_sycl_pool_alloc<char>  dst_contiguous(ctx.pool(), sizeof(float)*ggml_nelements(dst));
 
         src1_row.data = src1_contiguous.get();
         dst_row.data  =  dst_contiguous.get();
 
-        // Single-pass: count tokens per expert in O(n_tokens * n_ids) instead of O(n_as * n_tokens * n_ids)
-        // For Qwen3-30B: n_as=128, n_ids=8 — this reduces 128x iterations to 1x
-        std::vector<int64_t> expert_token_counts(n_as, 0);
+        // Count tokens per LOCAL expert
+        std::vector<int64_t> expert_token_counts(n_local_experts, 0);
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
             for (int64_t id = 0; id < n_ids; id++) {
                 const int32_t row_id_i = *(const int32_t *) (ids_host_ptr + iid1*ids->nb[1] + id*ids->nb[0]);
-                GGML_ASSERT(row_id_i >= 0 && row_id_i < n_as);
-                expert_token_counts[row_id_i]++;
+                if (ep_flag) {
+                    // EP: only count locally-owned experts
+                    if (row_id_i >= expert_offset && row_id_i < expert_offset + n_local_experts) {
+                        expert_token_counts[row_id_i - expert_offset]++;
+                    }
+                } else {
+                    GGML_ASSERT(row_id_i >= 0 && row_id_i < n_as);
+                    expert_token_counts[row_id_i]++;
+                }
             }
         }
 
-        for (int64_t i02 = 0; i02 < n_as; i02++) {
-            const int64_t num_src1_rows = expert_token_counts[i02];
+        for (int64_t local_i02 = 0; local_i02 < n_local_experts; local_i02++) {
+            const int64_t num_src1_rows = expert_token_counts[local_i02];
 
             if (num_src1_rows == 0) {
                 continue;
             }
+
+            // Global expert ID for the k_copy_src1_to_contiguous kernel
+            const int64_t global_i02 = ep_flag ? (local_i02 + expert_offset) : local_i02;
 
             ggml_sycl_pool_alloc<int> dev_cur_src1_row(ctx.pool(), 1);
             ggml_sycl_pool_alloc<mmid_row_mapping> dev_row_mapping(ctx.pool(), num_src1_rows);
@@ -4162,20 +4394,25 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                     size_t ids_nb_ct6 = ids->nb[1];
                     size_t ids_nb_ct7 = ids->nb[0];
 
+                    // k_copy_src1_to_contiguous compares against GLOBAL expert IDs
+                    // in the ids tensor, so pass the global ID here
+                    const int64_t kernel_i02 = global_i02;
+
                     cgh.parallel_for(
                         sycl::nd_range<3>(grid_dims * block_dims, block_dims),
                         [=](sycl::nd_item<3> item_ct1) {
                             k_copy_src1_to_contiguous(
                                 src1_original, src1_contiguous_get,
                                 dev_cur_src1_row_get,
-                                dev_row_mapping_get, ids_dev, i02,
+                                dev_row_mapping_get, ids_dev, kernel_i02,
                                 ids_nb_ct6, ids_nb_ct7, ne11, ne10, nb11, nb12,
                                 item_ct1, src1_row_acc);
                         });
                 });
             }
 
-            src0_row.data = src0_original + i02*nb02;
+            // Use LOCAL index to address into per-GPU weight tensor
+            src0_row.data = src0_original + local_i02*nb02;
 
             GGML_ASSERT(nb11 == sizeof(float)*ne10);
             GGML_ASSERT(nb1 == sizeof(float)*ne0);
@@ -4755,6 +4992,10 @@ catch (sycl::exception const &exc) {
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
 
+    // Invalidate quantization cache at subgraph boundary — src1 data pointers
+    // change between subgraphs so cached q8_1 data is no longer valid.
+    sycl_ctx->invalidate_q8_cache();
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
@@ -4763,6 +5004,34 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
         }
+
+        // Try fused expert aggregation: MUL(weighted) + VIEW×N + ADD×(N-1) → 1 kernel
+        if (node->op == GGML_OP_MUL) {
+            int fused = try_fused_expert_agg(*sycl_ctx, cgraph->nodes, cgraph->n_nodes, i);
+            if (fused > 0) {
+                i += fused - 1;  // -1 because the for loop does i++
+                continue;
+            }
+        }
+
+        // Try fused top-k select: SOFT_MAX + ARGSORT + GET_ROWS → 1 kernel
+        if (node->op == GGML_OP_SOFT_MAX) {
+            int fused = try_fused_topk_select(*sycl_ctx, cgraph->nodes, cgraph->n_nodes, i);
+            if (fused > 0) {
+                i += fused - 1;  // -1 because the for loop does i++
+                continue;
+            }
+        }
+
+        // Try fused ADD + RMSNorm: residual ADD + normalization → 1 kernel
+        if (node->op == GGML_OP_ADD) {
+            int fused = try_fused_add_rmsnorm(*sycl_ctx, cgraph->nodes, cgraph->n_nodes, i);
+            if (fused > 0) {
+                i += fused - 1;
+                continue;
+            }
+        }
+
 #ifndef NDEBUG
         assert(node->buffer->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device));
         for (int j = 0; j < GGML_MAX_SRC; j++) {
@@ -4812,22 +5081,64 @@ static bool is_node_noop(const ggml_tensor * node) {
 
 // Compute a topology-only key for a segment — ops, types, and node count, but NOT shapes.
 // This key is stable across KV cache growth; shape validation is done separately.
+static std::atomic<int> topo_debug_counter{0};
+
+static std::atomic<int> topo_global_call{0};
 static uint64_t compute_segment_topology_key(ggml_cgraph * cgraph, int start, int end, int segment_index) {
+    int call_num = topo_global_call.fetch_add(1);
+    // Log calls with ALL node shapes: first 10 (token 1 start) and 380-390 (token 2 start)
+    // With 129 sub-cgraphs × 3 devices = 387 calls per token
+    bool do_log = (call_num < 10 || (call_num >= 380 && call_num < 400));
+
     uint64_t h = (uint64_t)segment_index;
     h = h * 0x9e3779b97f4a7c15ULL + (uint64_t)(end - start);
+
+    if (do_log) {
+        GGML_LOG_INFO("[TOPO-DEBUG] call=%d seg_idx=%d start=%d end=%d range=%d n_nodes_total=%d\n",
+                      call_num, segment_index, start, end, end - start, cgraph->n_nodes);
+    }
+
     for (int i = start; i < end; i++) {
         const ggml_tensor * node = cgraph->nodes[i];
         h = h * 0x9e3779b97f4a7c15ULL + (uint64_t)node->op;
         h = h * 0x9e3779b97f4a7c15ULL + (uint64_t)node->type;
+        if (node->name) {
+            for (const char * p = node->name; *p; p++) {
+                h = h * 0x9e3779b97f4a7c15ULL + (uint64_t)(unsigned char)*p;
+            }
+        }
+
+        if (do_log) {
+            GGML_LOG_INFO("[TOPO-DEBUG]   node[%d] op=%d(%s) type=%d name='%s' ne=[%ld,%ld,%ld,%ld] noop=%d\n",
+                          i, (int)node->op, ggml_op_name(node->op), (int)node->type,
+                          node->name ? node->name : "(null)",
+                          (long)node->ne[0], (long)node->ne[1], (long)node->ne[2], (long)node->ne[3],
+                          is_node_noop(node) ? 1 : 0);
+        }
     }
+
+    if (do_log) {
+        GGML_LOG_INFO("[TOPO-DEBUG]   => topo_key=0x%016lx\n", h);
+    }
+
     return h;
 }
 
 // Compute a full shape hash including all ne[] dimensions — used to verify exact shape match.
 static uint64_t compute_segment_shape_hash(ggml_cgraph * cgraph, int start, int end) {
+    // Only hash shapes of compute nodes (exclude no-ops: VIEW, RESHAPE, PERMUTE, etc.).
+    // No-op nodes include activation views whose ne[] dimensions change with batch size
+    // (e.g. Qcur-0 (view) has ne=[128,n_heads,batch,1]). Including them causes
+    // unnecessary shape-hash changes during the prompt→decode transition, even though
+    // these no-op nodes don't produce any kernels in the recorded graph.
+    //
+    // Compute node output shapes (ne[]) determine kernel launch parameters and are
+    // sufficient for exact-match verification. Source tensor shapes are implicitly
+    // captured because they propagate through to the output shapes of compute ops.
     uint64_t h = 0;
     for (int i = start; i < end; i++) {
         const ggml_tensor * node = cgraph->nodes[i];
+        if (is_node_noop(node)) continue;
         for (int d = 0; d < GGML_MAX_DIMS; d++) {
             h = h * 0x9e3779b97f4a7c15ULL + (uint64_t)node->ne[d];
         }
@@ -4846,6 +5157,49 @@ static int count_segment_compute_nodes(ggml_cgraph * cgraph, int start, int end)
 
 // Record, cache, and replay a graphable segment of nodes [start, end).
 // Uses a two-level key: topology (ops+types) for cache lookup, full shape hash for validation.
+// Dispatch a range of nodes with fused expert aggregation support.
+// Returns after dispatching all nodes in [start, end), skipping no-ops and
+// fusing MUL+VIEW+ADD expert aggregation chains when detected.
+static void dispatch_nodes_with_fusion(
+        ggml_backend_sycl_context * sycl_ctx,
+        ggml_cgraph * cgraph,
+        int start, int end) {
+    for (int i = start; i < end; i++) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (is_node_noop(node)) continue;
+
+        // Try fused expert aggregation
+        if (node->op == GGML_OP_MUL) {
+            int fused = try_fused_expert_agg(*sycl_ctx, cgraph->nodes, cgraph->n_nodes, i);
+            if (fused > 0) {
+                i += fused - 1;  // -1 because the for loop does i++
+                continue;
+            }
+        }
+
+        // Try fused top-k select: SOFT_MAX + ARGSORT + GET_ROWS → 1 kernel
+        if (node->op == GGML_OP_SOFT_MAX) {
+            int fused = try_fused_topk_select(*sycl_ctx, cgraph->nodes, cgraph->n_nodes, i);
+            if (fused > 0) {
+                i += fused - 1;  // -1 because the for loop does i++
+                continue;
+            }
+        }
+
+        // Try fused ADD + RMSNorm
+        if (node->op == GGML_OP_ADD) {
+            int fused = try_fused_add_rmsnorm(*sycl_ctx, cgraph->nodes, cgraph->n_nodes, i);
+            if (fused > 0) {
+                i += fused - 1;
+                continue;
+            }
+        }
+
+        bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
+        GGML_ASSERT(ok);
+    }
+}
+
 // This handles KV cache growth gracefully — shapes change every token but topology is stable,
 // so we get one cache entry per segment that gets re-recorded only when shapes actually change.
 static void replay_or_record_segment(
@@ -4859,6 +5213,14 @@ static void replay_or_record_segment(
     // KV cache growth changes tensor ne[] every token, so hashing ne[] into the lookup key
     // causes 100% miss rate. Instead we key on topology and re-record when shapes change.
     const uint64_t topo_key   = compute_segment_topology_key(cgraph, start, end, segment_index);
+    {
+        static int key_log_count = 0;
+        if (++key_log_count <= 0) {
+            GGML_LOG_INFO("[SYCL-KEY] topo=0x%016lx seg=%d dev=%d nodes=[%d,%d) name0='%s'\n",
+                          topo_key, segment_index, sycl_ctx->device, start, end,
+                          (start < end && cgraph->nodes[start]->name) ? cgraph->nodes[start]->name : "?");
+        }
+    }
     const uint64_t shape_hash = compute_segment_shape_hash(cgraph, start, end);
 
     // Skip graph overhead for tiny segments (< 3 compute nodes)
@@ -4869,104 +5231,122 @@ static void replay_or_record_segment(
     if (compute_nodes < 3) {
         GGML_SYCL_DEBUG("[SYCL-GRAPH] seg %d skip, too small (%d compute nodes, nodes=[%d,%d))\n",
                         segment_index, compute_nodes, start, end);
-        for (int i = start; i < end; i++) {
-            ggml_tensor * node = cgraph->nodes[i];
-            if (is_node_noop(node)) continue;
-            bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
-            GGML_ASSERT(ok);
-        }
+        auto t0_d = std::chrono::high_resolution_clock::now();
+        dispatch_nodes_with_fusion(sycl_ctx, cgraph, start, end);
+        auto t1_d = std::chrono::high_resolution_clock::now();
+        double d_ms = std::chrono::duration<double,std::milli>(t1_d - t0_d).count();
+        sycl_ctx->graph_seg_direct++;
+        sycl_ctx->graph_total_ms += d_ms;
         return;
     }
 
     auto it = sycl_ctx->graph_cache.find(topo_key);
 
-    // For non-updatable graphs (e.g. Arc A770 limited_graph), skip shape validation
-    // (shapes change every token on MoE). Instead validate that tensor data pointers
-    // are stable — MoE expert routing can shift allocations, making recorded USM
-    // pointers stale (causes DEVICE_LOST). If pointers changed, re-record.
-    if (it != sycl_ctx->graph_cache.end() && !it->second.updatable) {
-        // Pointer-stability tracking: segments with unstable pointers (e.g. MoE
-        // expert routing shifts allocations) skip graph recording entirely after
-        // the second mismatch to avoid catastrophic re-record overhead.
-        if (it->second.ptr_miss_count >= 2) {
-            // Unstable segment — direct dispatch (no graph overhead)
-            GGML_SYCL_DEBUG("[SYCL-GRAPH] seg %d unstable (misses=%d), direct dispatch (topo=0x%lx, dev=%d, nodes=[%d,%d))\n",
-                            segment_index, it->second.ptr_miss_count, topo_key, sycl_ctx->device, start, end);
-            for (int i = start; i < end; i++) {
-                ggml_tensor * node = cgraph->nodes[i];
-                if (is_node_noop(node)) continue;
-                bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
-                GGML_ASSERT(ok);
-            }
-            return;
-        }
+    // Cache lookup debug — disabled by default, enable for diagnosis
+    // (Logging removed to reduce noise; uncomment for debugging)
 
-        // Validate that tensor data pointers haven't shifted (MoE expert routing
-        // can change allocation patterns, making recorded USM pointers stale).
-        bool ptrs_match = true;
-        const auto & recorded = it->second.recorded_data_ptrs;
-        int ptr_idx = 0;
-        for (int i = start; i < end && ptrs_match; i++) {
-            if (is_node_noop(cgraph->nodes[i])) continue;
-            if (ptr_idx >= (int)recorded.size() ||
-                cgraph->nodes[i]->data != recorded[ptr_idx]) {
-                ptrs_match = false;
+    // For non-updatable graphs (e.g. Arc A770 limited_graph), validate both shape
+    // and pointer stability. Shapes change on batch size transitions (prefill→decode)
+    // — this is expected and warrants a clean re-record. Pointer changes within the
+    // SAME shape indicate allocation instability (e.g. MoE expert routing shifts) —
+    // after 2 such mismatches, skip graphs entirely for this segment.
+    if (it != sycl_ctx->graph_cache.end() && !it->second.updatable) {
+        const bool shape_changed = (it->second.shape_hash != shape_hash);
+
+        if (shape_changed) {
+            // Shape transition (e.g. prefill→decode or batch size change).
+            // This is expected — fall through to re-record without incrementing
+            // the pointer miss counter. The re-record will update both the shape
+            // hash and pointer snapshot.
+            GGML_SYCL_DEBUG("[SYCL-GRAPH] seg %d shape-changed, re-record (topo=0x%lx, dev=%d, nodes=[%d,%d))\n",
+                            segment_index, topo_key, sycl_ctx->device, start, end);
+
+            // Fall through to the recording path below
+        } else {
+            // Same shape — check pointer stability for safe replay.
+            if (it->second.ptr_miss_count >= 2) {
+                // Unstable segment — direct dispatch (no graph overhead)
+                GGML_SYCL_DEBUG("[SYCL-GRAPH] seg %d unstable (misses=%d), direct dispatch (topo=0x%lx, dev=%d, nodes=[%d,%d))\n",
+                                segment_index, it->second.ptr_miss_count, topo_key, sycl_ctx->device, start, end);
+                auto t0_d = std::chrono::high_resolution_clock::now();
+                dispatch_nodes_with_fusion(sycl_ctx, cgraph, start, end);
+                auto t1_d = std::chrono::high_resolution_clock::now();
+                double d_ms = std::chrono::duration<double,std::milli>(t1_d - t0_d).count();
+                sycl_ctx->graph_seg_direct++;
+                sycl_ctx->graph_total_ms += d_ms;
+                return;
             }
-            // Also check source tensors
-            if (ptrs_match) {
-                for (int s = 0; s < GGML_MAX_SRC && ptrs_match; s++) {
-                    if (cgraph->nodes[i]->src[s] == nullptr) break;
-                    ptr_idx++;
-                    if (ptr_idx >= (int)recorded.size() ||
-                        cgraph->nodes[i]->src[s]->data != recorded[ptr_idx]) {
-                        ptrs_match = false;
+
+            // Validate that tensor data pointers haven't shifted.
+            bool ptrs_match = true;
+            const auto & recorded = it->second.recorded_data_ptrs;
+            int ptr_idx = 0;
+            for (int i = start; i < end && ptrs_match; i++) {
+                if (is_node_noop(cgraph->nodes[i])) continue;
+                if (ptr_idx >= (int)recorded.size() ||
+                    cgraph->nodes[i]->data != recorded[ptr_idx]) {
+                    ptrs_match = false;
+                }
+                if (ptrs_match) {
+                    for (int s = 0; s < GGML_MAX_SRC && ptrs_match; s++) {
+                        if (cgraph->nodes[i]->src[s] == nullptr) break;
+                        ptr_idx++;
+                        if (ptr_idx >= (int)recorded.size() ||
+                            cgraph->nodes[i]->src[s]->data != recorded[ptr_idx]) {
+                            ptrs_match = false;
+                        }
                     }
                 }
+                ptr_idx++;
             }
-            ptr_idx++;
-        }
-        if (ptrs_match && ptr_idx == (int)recorded.size()) {
-            GGML_SYCL_DEBUG("[SYCL-GRAPH] seg %d hit, replay-ptrs-ok (topo=0x%lx, dev=%d, nodes=[%d,%d))\n",
-                            segment_index, topo_key, sycl_ctx->device, start, end);
-            sycl_ctx->stream()->ext_oneapi_graph(*(it->second.exec));
-            return;
-        }
-        // Pointers changed — increment miss counter and decide action
-        it->second.ptr_miss_count++;
-        GGML_SYCL_DEBUG("[SYCL-GRAPH] seg %d ptr-mismatch #%d, %s (topo=0x%lx, dev=%d, nodes=[%d,%d))\n",
-                        segment_index, it->second.ptr_miss_count,
-                        it->second.ptr_miss_count >= 2 ? "marking unstable" : "re-record",
-                        topo_key, sycl_ctx->device, start, end);
-        if (it->second.ptr_miss_count >= 2) {
-            // Just crossed the threshold — direct dispatch from now on
-            for (int i = start; i < end; i++) {
-                ggml_tensor * node = cgraph->nodes[i];
-                if (is_node_noop(node)) continue;
-                bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
-                GGML_ASSERT(ok);
+            if (ptrs_match && ptr_idx == (int)recorded.size()) {
+                GGML_SYCL_DEBUG("[SYCL-GRAPH] seg %d hit, replay-ptrs-ok (topo=0x%lx, dev=%d, nodes=[%d,%d))\n",
+                                segment_index, topo_key, sycl_ctx->device, start, end);
+                it->second.last_used = ++sycl_ctx->graph_cache_access_counter;
+                auto t0_r = std::chrono::high_resolution_clock::now();
+                sycl_ctx->stream()->ext_oneapi_graph(*(it->second.exec));
+                auto t1_r = std::chrono::high_resolution_clock::now();
+                double r_ms = std::chrono::duration<double,std::milli>(t1_r - t0_r).count();
+                sycl_ctx->graph_seg_replayed++;
+                sycl_ctx->graph_total_ms += r_ms;
+                return;
             }
-            return;
+            // Same shape but pointers changed — allocation instability
+            it->second.ptr_miss_count++;
+            GGML_SYCL_DEBUG("[SYCL-GRAPH] seg %d ptr-mismatch #%d, %s (topo=0x%lx, dev=%d, nodes=[%d,%d))\n",
+                            segment_index, it->second.ptr_miss_count,
+                            it->second.ptr_miss_count >= 2 ? "marking unstable" : "re-record",
+                            topo_key, sycl_ctx->device, start, end);
+            if (it->second.ptr_miss_count >= 2) {
+                auto t0_d = std::chrono::high_resolution_clock::now();
+                dispatch_nodes_with_fusion(sycl_ctx, cgraph, start, end);
+                auto t1_d = std::chrono::high_resolution_clock::now();
+                double d_ms = std::chrono::duration<double,std::milli>(t1_d - t0_d).count();
+                sycl_ctx->graph_seg_direct++;
+                sycl_ctx->graph_total_ms += d_ms;
+                return;
+            }
+            // ptr_miss_count == 1: fall through to re-record once
         }
-        // ptr_miss_count == 1: fall through to re-record once
     }
 
     if (it != sycl_ctx->graph_cache.end() && it->second.updatable && it->second.shape_hash == shape_hash) {
         // Exact topology + shape match — updatable graph path
+        it->second.last_used = ++sycl_ctx->graph_cache_access_counter;
 
         // Updatable cached graph — record new graph then update the cached executable
         sycl_ex::command_graph model_graph(*(sycl_ctx->stream()),
             {sycl_ex::property::graph::assume_buffer_outlives_graph{}});
+        auto t0_rec = std::chrono::high_resolution_clock::now();
         model_graph.begin_recording(*(sycl_ctx->stream()));
         sycl_ctx->graph_recording = true;
-        for (int i = start; i < end; i++) {
-            ggml_tensor * node = cgraph->nodes[i];
-            if (is_node_noop(node)) continue;
-            bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
-            GGML_ASSERT(ok);
-        }
+        dispatch_nodes_with_fusion(sycl_ctx, cgraph, start, end);
         sycl_ctx->graph_recording = false;
         model_graph.end_recording();
+        auto t1_rec = std::chrono::high_resolution_clock::now();
+        double rec_ms = std::chrono::duration<double,std::milli>(t1_rec - t0_rec).count();
 
+        double fin_ms = 0.0;
         try {
             it->second.exec->update(model_graph);
             GGML_SYCL_DEBUG("[SYCL-GRAPH] seg %d hit, update ok (topo=0x%lx, dev=%d, nodes=[%d,%d))\n",
@@ -4974,36 +5354,80 @@ static void replay_or_record_segment(
         } catch (sycl::exception const & e) {
             GGML_LOG_INFO("[SYCL-GRAPH] seg %d update failed (topo=0x%lx, dev=%d): %s — re-finalizing\n",
                           segment_index, topo_key, sycl_ctx->device, e.what());
+            auto t0_fin = std::chrono::high_resolution_clock::now();
             auto exec = model_graph.finalize(sycl_ex::property::graph::updatable{});
+            auto t1_fin = std::chrono::high_resolution_clock::now();
+            fin_ms = std::chrono::duration<double,std::milli>(t1_fin - t0_fin).count();
             it->second.exec = std::make_unique<
                 sycl_ex::command_graph<sycl_ex::graph_state::executable>>(exec);
         }
+        auto t0_rpl = std::chrono::high_resolution_clock::now();
         sycl_ctx->stream()->ext_oneapi_graph(*(it->second.exec));
+        auto t1_rpl = std::chrono::high_resolution_clock::now();
+        double rpl_ms = std::chrono::duration<double,std::milli>(t1_rpl - t0_rpl).count();
+        GGML_LOG_INFO("[SYCL-GRAPH] record: %.1fms, finalize: %.1fms, replay: %.1fms (seg %d, dev=%d, nodes=[%d,%d)) [update]\n",
+                      rec_ms, fin_ms, rpl_ms, segment_index, sycl_ctx->device, start, end);
+        sycl_ctx->graph_seg_replayed++;
+        sycl_ctx->graph_total_ms += rec_ms + fin_ms + rpl_ms;
         return;
     }
 
     // Cache miss OR shape mismatch — record, finalize, and replace cache entry.
     // Shape mismatch (e.g. KV cache growth) replaces the old entry in-place,
     // keeping cache size bounded to one entry per topology.
+    //
+    // Recording budget: safety limit on new graph compilations per graph_compute call.
+    // Set high (999) to compile all segments in one pass. The one-time cost is
+    // acceptable (~73ms/seg first time, ~1ms after JIT cached).
+    if (sycl_ctx->graph_record_budget <= 0) {
+        GGML_SYCL_DEBUG("[SYCL-GRAPH] seg %d budget exhausted, direct dispatch (topo=0x%lx, dev=%d, nodes=[%d,%d))\n",
+                        segment_index, topo_key, sycl_ctx->device, start, end);
+        auto t0_d = std::chrono::high_resolution_clock::now();
+        dispatch_nodes_with_fusion(sycl_ctx, cgraph, start, end);
+        auto t1_d = std::chrono::high_resolution_clock::now();
+        double d_ms = std::chrono::duration<double,std::milli>(t1_d - t0_d).count();
+        sycl_ctx->graph_seg_direct++;
+        sycl_ctx->graph_total_ms += d_ms;
+        return;
+    }
+    sycl_ctx->graph_record_budget--;
+
+    // Evict LRU entry if cache is at capacity (DG2/Arc ~127 exec graph limit per device)
+    if (it == sycl_ctx->graph_cache.end() && (int)sycl_ctx->graph_cache.size() >= sycl_ctx->GRAPH_CACHE_MAX_SIZE) {
+        // Find LRU entry (lowest last_used counter)
+        auto lru_it = sycl_ctx->graph_cache.begin();
+        for (auto candidate = sycl_ctx->graph_cache.begin(); candidate != sycl_ctx->graph_cache.end(); ++candidate) {
+            if (candidate->second.last_used < lru_it->second.last_used) {
+                lru_it = candidate;
+            }
+        }
+        GGML_LOG_INFO("[SYCL-GRAPH] cache eviction: removed topo=0x%lx (cache was %zu, limit %d, dev=%d)\n",
+                      (unsigned long)lru_it->first, sycl_ctx->graph_cache.size(),
+                      sycl_ctx->GRAPH_CACHE_MAX_SIZE, sycl_ctx->device);
+        sycl_ctx->graph_cache.erase(lru_it);
+    }
+
     const bool is_shape_mismatch = (it != sycl_ctx->graph_cache.end());
     sycl_ex::command_graph model_graph(*(sycl_ctx->stream()),
         {sycl_ex::property::graph::assume_buffer_outlives_graph{}});
+    auto t0_rec = std::chrono::high_resolution_clock::now();
     model_graph.begin_recording(*(sycl_ctx->stream()));
     sycl_ctx->graph_recording = true;
-    for (int i = start; i < end; i++) {
-        ggml_tensor * node = cgraph->nodes[i];
-        if (is_node_noop(node)) continue;
-        bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
-        GGML_ASSERT(ok);
-    }
+    dispatch_nodes_with_fusion(sycl_ctx, cgraph, start, end);
     sycl_ctx->graph_recording = false;
     model_graph.end_recording();
+    auto t1_rec = std::chrono::high_resolution_clock::now();
+    double rec_ms = std::chrono::duration<double,std::milli>(t1_rec - t0_rec).count();
 
+    double fin_ms = 0.0;
     if (can_update) {
+        auto t0_fin = std::chrono::high_resolution_clock::now();
         auto exec = model_graph.finalize(sycl_ex::property::graph::updatable{});
+        auto t1_fin = std::chrono::high_resolution_clock::now();
+        fin_ms = std::chrono::duration<double,std::milli>(t1_fin - t0_fin).count();
         sycl_ctx->graph_cache[topo_key] = {
             std::make_unique<sycl_ex::command_graph<sycl_ex::graph_state::executable>>(exec),
-            true, shape_hash, {}, 0
+            true, shape_hash, {}, 0, ++sycl_ctx->graph_cache_access_counter
         };
     } else {
         // Capture tensor data pointers for later validation on replay.
@@ -5017,21 +5441,33 @@ static void replay_or_record_segment(
                 ptrs.push_back(cgraph->nodes[i]->src[s]->data);
             }
         }
-        // Preserve ptr_miss_count from existing entry (tracks pointer stability)
-        int prev_miss_count = (it != sycl_ctx->graph_cache.end()) ? it->second.ptr_miss_count : 0;
+        // Preserve ptr_miss_count ONLY for same-shape re-records (pointer instability).
+        // Shape-change re-records reset the count — pointers naturally change with shapes.
+        int prev_miss_count = 0;
+        if (it != sycl_ctx->graph_cache.end() && it->second.shape_hash == shape_hash) {
+            prev_miss_count = it->second.ptr_miss_count;
+        }
+        auto t0_fin = std::chrono::high_resolution_clock::now();
         auto exec = model_graph.finalize();
+        auto t1_fin = std::chrono::high_resolution_clock::now();
+        fin_ms = std::chrono::duration<double,std::milli>(t1_fin - t0_fin).count();
         sycl_ctx->graph_cache[topo_key] = {
             std::make_unique<sycl_ex::command_graph<sycl_ex::graph_state::executable>>(exec),
-            false, shape_hash, std::move(ptrs), prev_miss_count
+            false, shape_hash, std::move(ptrs), prev_miss_count, ++sycl_ctx->graph_cache_access_counter
         };
     }
-    GGML_SYCL_DEBUG("[SYCL-GRAPH] seg %d %s, compiled (topo=0x%lx, dev=%d, nodes=[%d,%d), cache=%zu)\n",
-                  segment_index, is_shape_mismatch ? "shape-changed" : "miss",
-                  topo_key, sycl_ctx->device, start, end,
-                  sycl_ctx->graph_cache.size());
 
     // Replay the newly cached executable graph
+    auto t0_rpl = std::chrono::high_resolution_clock::now();
     sycl_ctx->stream()->ext_oneapi_graph(*(sycl_ctx->graph_cache[topo_key].exec));
+    auto t1_rpl = std::chrono::high_resolution_clock::now();
+    double rpl_ms = std::chrono::duration<double,std::milli>(t1_rpl - t0_rpl).count();
+
+    GGML_LOG_INFO("[SYCL-GRAPH] record: %.1fms, finalize: %.1fms, replay: %.1fms (seg %d, dev=%d, nodes=[%d,%d)) [%s]\n",
+                  rec_ms, fin_ms, rpl_ms, segment_index, sycl_ctx->device, start, end,
+                  is_shape_mismatch ? "shape-changed" : "miss");
+    sycl_ctx->graph_seg_recorded++;
+    sycl_ctx->graph_total_ms += rec_ms + fin_ms + rpl_ms;
 }
 
 #endif
@@ -5220,11 +5656,36 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
         const bool can_update = cached_can_update;
         ggml_sycl_set_main_device(sycl_ctx->device);
 
+        // Reset per-call timing counters
+        sycl_ctx->graph_seg_replayed = 0;
+        sycl_ctx->graph_seg_recorded = 0;
+        sycl_ctx->graph_seg_direct   = 0;
+        sycl_ctx->graph_total_ms     = 0.0;
+
+        // Replenish recording budget: add 1 per graph_compute call, capped at max.
+        // Budget is set high (999) so all segments compile in one pass.
+        // First-token compilation cost is acceptable (~73ms/seg × N segments).
+        if (sycl_ctx->graph_record_budget < ggml_backend_sycl_context::GRAPH_RECORD_BUDGET_MAX) {
+            sycl_ctx->graph_record_budget++;
+        }
+
         // Segmented graph dispatch: iterate through nodes, split at non-graphable
         // boundaries (MUL_MAT_ID, CONCAT). Record+replay graphable segments,
         // dispatch non-graphable nodes directly.
         int seg_start = -1;  // Start index of current graphable segment (-1 = none)
         int seg_index = 0;   // Monotonic segment counter for shape key disambiguation
+
+        // Log each graph_compute call on dev=0
+        {
+            static std::atomic<int> gc_counter{0};
+            int gcc = (sycl_ctx->device == 0) ? gc_counter.fetch_add(1) : 9999;
+            if (gcc < 20) {
+                GGML_LOG_INFO("[GC-TRACE] graph_compute #%d dev=0 ctx=%p cgraph=%p n_nodes=%d cache_sz=%zu node0='%s'\n",
+                              gcc, (void*)sycl_ctx, (void*)cgraph, cgraph->n_nodes,
+                              sycl_ctx->graph_cache.size(),
+                              (cgraph->n_nodes > 0 && cgraph->nodes[0]->name) ? cgraph->nodes[0]->name : "?");
+            }
+        }
 
         for (int i = 0; i <= cgraph->n_nodes; i++) {
             bool graphable = false;
@@ -5264,6 +5725,13 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
             }
             // No-op nodes: don't break segments, don't dispatch — just accumulate into current segment
             // If seg_start >= 0, they're included in the segment range (and skipped during recording).
+        }
+
+        // Per-token summary
+        if (sycl_ctx->graph_seg_recorded > 0 || sycl_ctx->graph_seg_replayed > 0) {
+            GGML_LOG_INFO("[SYCL-GRAPH] token summary: %d replayed, %d recorded, %d direct, total %.1fms (dev=%d)\n",
+                          sycl_ctx->graph_seg_replayed, sycl_ctx->graph_seg_recorded,
+                          sycl_ctx->graph_seg_direct, sycl_ctx->graph_total_ms, sycl_ctx->device);
         }
 
         return GGML_STATUS_SUCCESS;
@@ -5846,9 +6314,19 @@ static ggml_backend_dev_t ggml_backend_sycl_reg_get_device(ggml_backend_reg_t re
     return ctx->devices[index];
 }
 
-// Direct host-staged AllReduce for tensor parallelism.
-// Each GPU copies partial results to host, host sums with AVX, results copied back.
-// One round instead of meta backend's pairwise exchange (N-1 rounds).
+// GPU-side AllReduce for tensor parallelism.
+//
+// Architecture: host-memory rendezvous with GPU-side reduction kernel.
+// 1. Each GPU copies its partial result to a dedicated slot in shared host USM staging
+// 2. GPU0 launches a reduction kernel that reads all N slots from host memory and writes sum to slot 0
+// 3. Each GPU copies the result from slot 0 back to its tensor
+//
+// All steps are chained via SYCL events — ZERO host blocking.
+// The host thread submits the full pipeline and returns immediately.
+// In-order queue semantics on each device guarantee correctness for downstream compute.
+//
+// For large tensors (>256KB), falls back to host-side reduction which is bandwidth-optimal
+// since CPU memory reads at ~40 GB/s vs GPU reading host memory over PCIe at ~12 GB/s.
 static bool ggml_backend_sycl_allreduce_tensor(
         ggml_backend_t * backends, struct ggml_tensor ** tensors, size_t n_backends) {
     if (n_backends < 2) return true;
@@ -5859,7 +6337,6 @@ static bool ggml_backend_sycl_allreduce_tensor(
     static int ar_count = 0;
     static double ar_total_ms = 0;
     ar_count++;
-    // Only time the first few calls and periodically — chrono overhead adds up
     const bool do_timing = (ar_count <= 5 || ar_count % 200 == 0);
     std::chrono::high_resolution_clock::time_point t0;
     if (do_timing) {
@@ -5873,12 +6350,11 @@ static bool ggml_backend_sycl_allreduce_tensor(
 
     const size_t nbytes = ne * sizeof(float);
 
-    // Use first backend's staging buffer (grows as needed)
     ggml_backend_sycl_context * ctx0 = (ggml_backend_sycl_context *)backends[0]->context;
 
-    // Need n_backends host buffers: one per GPU's partial result
-    // Reuse ctx0's staging for the first, allocate temp for rest
-    const size_t total_staging = nbytes * n_backends;
+    // Need n_backends+1 host buffer slots: N for partials + 1 for reduction output
+    // Using a separate output slot avoids read-write hazard on slot 0
+    const size_t total_staging = nbytes * (n_backends + 1);
     void * staging_base = ctx0->get_staging(total_staging);
     if (!staging_base) return false;
 
@@ -5886,52 +6362,114 @@ static bool ggml_backend_sycl_allreduce_tensor(
     for (size_t i = 0; i < n_backends; ++i) {
         host_bufs[i] = (float *)((char *)staging_base + i * nbytes);
     }
+    float * host_result = (float *)((char *)staging_base + n_backends * nbytes);
 
-    // Step 1: All GPUs → host (parallel — each on its own queue)
+    // Step 1: All GPUs → host staging (parallel, async, event-tracked)
+    sycl::event d2h_events[GGML_SYCL_MAX_DEVICES];
     for (size_t i = 0; i < n_backends; ++i) {
         ggml_backend_sycl_context * ctx = (ggml_backend_sycl_context *)backends[i]->context;
         const queue_ptr stream = ctx->stream(ctx->device, 0);
-        SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(host_bufs[i], tensors[i]->data, nbytes)));
+        d2h_events[i] = stream->memcpy(host_bufs[i], tensors[i]->data, nbytes);
     }
 
-    // Wait for all GPU→host copies
-    for (size_t i = 0; i < n_backends; ++i) {
-        ggml_backend_sycl_context * ctx = (ggml_backend_sycl_context *)backends[i]->context;
-        SYCL_CHECK(CHECK_TRY_ERROR(ctx->stream(ctx->device, 0)->wait()));
-    }
+    // Threshold: GPU-side reduction wins for small tensors where host sync overhead dominates.
+    // For large tensors, host-side is faster (CPU reads host memory at ~40 GB/s, GPU at ~12 GB/s over PCIe).
+    // 256KB ≈ 64K floats. Below this, the host wait() overhead (~50-100µs) dominates the actual sum time.
+    const bool use_gpu_reduction = (nbytes <= 256 * 1024);
 
-    // Step 2: Sum on host (in-place into host_bufs[0])
-    // For 3 GPUs (n_backends=3), sum buf[1] and buf[2] into buf[0].
-    // The loop is auto-vectorizable by the compiler (no aliasing, simple float add).
-    {
+    // Helper lambda for host-side reduction fallback
+    auto do_host_reduction = [&]() {
+        for (size_t i = 0; i < n_backends; ++i) {
+            d2h_events[i].wait();
+        }
+        // Fused 3-way sum for common n_backends=3 case — single pass halves memory traffic
         float * __restrict__ acc = host_bufs[0];
-        for (size_t i = 1; i < n_backends; ++i) {
-            const float * __restrict__ src = host_bufs[i];
+        if (n_backends == 3) {
+            const float * __restrict__ src1 = host_bufs[1];
+            const float * __restrict__ src2 = host_bufs[2];
             for (int64_t j = 0; j < ne; ++j) {
-                acc[j] += src[j];
+                acc[j] += src1[j] + src2[j];
+            }
+        } else {
+            for (size_t i = 1; i < n_backends; ++i) {
+                const float * __restrict__ src = host_bufs[i];
+                for (int64_t j = 0; j < ne; ++j) {
+                    acc[j] += src[j];
+                }
             }
         }
-    }
+        for (size_t i = 0; i < n_backends; ++i) {
+            ggml_backend_sycl_context * ctx = (ggml_backend_sycl_context *)backends[i]->context;
+            const queue_ptr stream = ctx->stream(ctx->device, 0);
+            SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(tensors[i]->data, acc, nbytes)));
+        }
+    };
 
-    // Step 3: Host → all GPUs (parallel)
-    for (size_t i = 0; i < n_backends; ++i) {
-        ggml_backend_sycl_context * ctx = (ggml_backend_sycl_context *)backends[i]->context;
-        const queue_ptr stream = ctx->stream(ctx->device, 0);
-        SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(tensors[i]->data, host_bufs[0], nbytes)));
-    }
+    if (use_gpu_reduction) {
+        // GPU-SIDE REDUCTION: zero host blocking
+        // GPU0 launches a kernel that reads all N partial buffers from host USM and writes sum to host_result.
+        // The kernel depends on ALL D2H copy events completing first.
+        const queue_ptr stream0 = ctx0->stream(ctx0->device, 0);
 
-    // Wait for all host→GPU copies
-    for (size_t i = 0; i < n_backends; ++i) {
-        ggml_backend_sycl_context * ctx = (ggml_backend_sycl_context *)backends[i]->context;
-        SYCL_CHECK(CHECK_TRY_ERROR(ctx->stream(ctx->device, 0)->wait()));
+        // Dependency events for the reduction kernel
+        std::vector<sycl::event> dep_events(d2h_events, d2h_events + n_backends);
+
+        // Launch reduction kernel on GPU0 — reads host_bufs[0..N-1], writes host_result
+        // GPU0's in-order queue already orders after its own D2H copy;
+        // we add explicit depends_on for other GPUs' D2H events.
+        sycl::event reduce_event;
+        if (n_backends == 3) {
+            // Specialized 3-way sum kernel (common case)
+            const float * src0 = host_bufs[0];
+            const float * src1 = host_bufs[1];
+            const float * src2 = host_bufs[2];
+            float * dst = host_result;
+            const int64_t count = ne;
+            reduce_event = stream0->submit([&](sycl::handler & cgh) {
+                cgh.depends_on(dep_events);
+                cgh.parallel_for(sycl::range<1>(count), [=](sycl::id<1> idx) {
+                    dst[idx] = src0[idx] + src1[idx] + src2[idx];
+                });
+            });
+        } else {
+            // Generic N-way: n_backends is always small (2-8), just unroll at runtime
+            // For n_backends != 3, fall back to host reduction (rare path, not worth complexity)
+            do_host_reduction();
+            goto done;
+        }
+
+        // Step 3: Host result → all GPUs (parallel, fire-and-forget)
+        // Each GPU's queue must wait for the reduce kernel before reading host_result.
+        // GPU0's in-order queue already orders after the kernel.
+        // GPU1/GPU2 need explicit event dependency.
+        for (size_t i = 0; i < n_backends; ++i) {
+            ggml_backend_sycl_context * ctx = (ggml_backend_sycl_context *)backends[i]->context;
+            const queue_ptr stream = ctx->stream(ctx->device, 0);
+            if (i == 0) {
+                // GPU0: in-order queue, reduce_event already on this queue — just memcpy
+                SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(tensors[i]->data, host_result, nbytes)));
+            } else {
+                // GPU1/GPU2: must wait for GPU0's reduce kernel to finish
+                stream->submit([&](sycl::handler & cgh) {
+                    cgh.depends_on(reduce_event);
+                    cgh.memcpy(tensors[i]->data, host_result, nbytes);
+                });
+            }
+        }
+    } else {
+        // HOST-SIDE REDUCTION: optimal for large tensors (>256KB)
+        // Block host to wait for D2H copies, sum on CPU (AVX-512 auto-vectorized), fire-and-forget H2D.
+        do_host_reduction();
     }
+    done:
 
     if (do_timing) {
         auto t1 = std::chrono::high_resolution_clock::now();
         double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         ar_total_ms += ms;
-        GGML_LOG_INFO("[AR] #%d ne=%" PRId64 " %.1fms (total %.0fms, avg %.2fms)\n",
-                ar_count, ne, ms, ar_total_ms, ar_total_ms / ar_count);
+        const char * mode = (nbytes <= 256 * 1024) ? "GPU" : "HOST";
+        GGML_LOG_INFO("[AR] #%d ne=%" PRId64 " %s %.1fms (total %.0fms, avg %.2fms)\n",
+                ar_count, ne, mode, ms, ar_total_ms, ar_total_ms / ar_count);
     }
 
     return true;
