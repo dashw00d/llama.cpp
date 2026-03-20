@@ -991,10 +991,146 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 GGML_ASSERT(ggml_backend_meta_get_split_state(node->src[1], /*assume_sync =*/ false).axis != GGML_BACKEND_SPLIT_AXIS_PARTIAL);
             }
             const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);
+
+            // EP subgraph merging: defer AllReduce for element-wise ops that descend from an
+            // EP MUL_MAT_ID (SPLIT_AXIS_2 src0). The zero-padding structure of EP PARTIAL
+            // tensors is preserved through element-wise ops (SiLU, MUL gate, etc.), so only
+            // the final EP MUL_MAT_ID (down projection) needs to fire the AllReduce.
+            //
+            // We extend deferral beyond just MUL_MAT_ID nodes by tracing back through
+            // element-wise ops (UNARY, MUL, ADD) to detect if a PARTIAL node is part of
+            // an EP MoE chain. If so, we apply the same lookahead to decide whether a
+            // future EP MUL_MAT_ID exists in the same block.
+            bool defer_ep_allreduce = false;
             if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+                // Determine whether this PARTIAL node is part of an EP chain.
+                // Direct case: this node itself is an EP MUL_MAT_ID.
+                // Indirect case: trace back through element-wise ops to find an EP MUL_MAT_ID.
+                bool is_ep_node = false;
+
+                auto is_ep_mul_mat_id = [&](ggml_tensor * t) -> bool {
+                    if (t == nullptr || t->op != GGML_OP_MUL_MAT_ID || t->src[0] == nullptr) {
+                        return false;
+                    }
+                    if (!ggml_backend_buffer_is_meta(t->src[0]->buffer)) {
+                        return false;
+                    }
+                    const ggml_backend_meta_split_state s =
+                        ggml_backend_meta_get_split_state(t->src[0], /*assume_sync =*/ true);
+                    return s.axis == GGML_BACKEND_SPLIT_AXIS_2;
+                };
+
+                if (is_ep_mul_mat_id(node)) {
+                    is_ep_node = true;
+                } else {
+                    // Trace back through element-wise ops (up to 8 levels) to find an
+                    // ancestor EP MUL_MAT_ID. Only follow the PARTIAL source at each step.
+                    ggml_tensor * t = node;
+                    for (int depth = 0; depth < 8 && t != nullptr && !is_ep_node; depth++) {
+                        ggml_tensor * parent = nullptr;
+                        if (t->op == GGML_OP_UNARY) {
+                            parent = t->src[0];
+                        } else if (t->op == GGML_OP_MUL || t->op == GGML_OP_ADD ||
+                                   t->op == GGML_OP_DIV || t->op == GGML_OP_SUB) {
+                            // Follow whichever src is PARTIAL
+                            for (int si = 0; si < 2 && parent == nullptr; si++) {
+                                if (t->src[si] != nullptr) {
+                                    const ggml_backend_meta_split_state ss =
+                                        ggml_backend_meta_get_split_state(t->src[si], false);
+                                    if (ss.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+                                        parent = t->src[si];
+                                    }
+                                }
+                            }
+                        } else {
+                            break;
+                        }
+                        if (parent == nullptr) {
+                            break;
+                        }
+                        if (is_ep_mul_mat_id(parent)) {
+                            is_ep_node = true;
+                            break;
+                        }
+                        t = parent;
+                    }
+                }
+
+                if (is_ep_node) {
+                    // Look ahead: if another EP MUL_MAT_ID (e.g. down proj) exists in the
+                    // same MoE block within 60 nodes, defer — it will carry the AllReduce.
+                    for (int k = i + 1; k < cgraph->n_nodes && k < i + 60; k++) {
+                        ggml_tensor * future = cgraph->nodes[k];
+                        if (is_ep_mul_mat_id(future)) {
+                            defer_ep_allreduce = true;
+                            break;
+                        }
+                        // Stop early if we hit a non-EP PARTIAL (TP attention boundary)
+                        if (future->op == GGML_OP_MUL_MAT) {
+                            const ggml_backend_meta_split_state future_ss =
+                                ggml_backend_meta_get_split_state(future, /*assume_sync =*/ false);
+                            if (future_ss.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Deferred attention AllReduce (defer_attn_allreduce):
+            // Detect the deferred-PARTIAL fusion pattern from DESIGN-deferred-attn-partial.md
+            // (Section 6.1 change 3). When the wo projection (non-EP MUL_MAT with SPLIT_AXIS_0
+            // src) produces a PARTIAL output, look ahead for an ADD(PARTIAL, PARTIAL) node
+            // downstream. If found, defer the AllReduce boundary past both the MoE block and
+            // the combined ADD — letting wo_partial and down_partial be summed first.
+            // This halves AllReduce count per layer: 2 → 1 boundary per transformer layer.
+            // NOTE: Only apply to direct wo MUL_MAT nodes (op == MUL_MAT with SPLIT_AXIS_0
+            // src[0]). Do NOT apply to combined_partial (GGML_OP_ADD) — that must fire AllReduce.
+            bool defer_attn_allreduce = false;
+            if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL && !defer_ep_allreduce &&
+                    node->op == GGML_OP_MUL_MAT && node->src[0] != nullptr &&
+                    ggml_backend_buffer_is_meta(node->src[0]->buffer)) {
+                // Confirm src[0] is SPLIT_AXIS_0 (TP wo weight, not EP down or other).
+                const ggml_backend_meta_split_state src0_ss =
+                    ggml_backend_meta_get_split_state(node->src[0], /*assume_sync =*/ true);
+                if (src0_ss.axis == GGML_BACKEND_SPLIT_AXIS_0) {
+                    // Look ahead for ADD(PARTIAL, PARTIAL) within the MoE block (~200 nodes).
+                    // Stop early if we hit another non-EP PARTIAL MUL_MAT (next layer's wo).
+                    for (int k = i + 1; k < cgraph->n_nodes && k < i + 200; k++) {
+                        ggml_tensor * future = cgraph->nodes[k];
+                        if (future->op == GGML_OP_ADD &&
+                                future->src[0] != nullptr && future->src[1] != nullptr) {
+                            const ggml_backend_meta_split_state ss0 =
+                                ggml_backend_meta_get_split_state(future->src[0], false);
+                            const ggml_backend_meta_split_state ss1 =
+                                ggml_backend_meta_get_split_state(future->src[1], false);
+                            if (ss0.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL &&
+                                    ss1.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+                                defer_attn_allreduce = true;
+                                break;
+                            }
+                        }
+                        // Stop if we encounter another non-EP PARTIAL MUL_MAT.
+                        // This would be the next layer's wo — don't span across layers.
+                        if (future->op == GGML_OP_MUL_MAT && future->src[0] != nullptr &&
+                                ggml_backend_buffer_is_meta(future->src[0]->buffer)) {
+                            const ggml_backend_meta_split_state future_ss =
+                                ggml_backend_meta_get_split_state(future, false);
+                            if (future_ss.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (!defer_ep_allreduce && !defer_attn_allreduce &&
+                    split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
                 max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node));
             }
-            const bool new_subgraph = i + 1 == cgraph->n_nodes || split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL;
+            const bool new_subgraph = i + 1 == cgraph->n_nodes ||
+                (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL &&
+                 !defer_ep_allreduce && !defer_attn_allreduce);
             if (!new_subgraph) {
                 continue;
             }

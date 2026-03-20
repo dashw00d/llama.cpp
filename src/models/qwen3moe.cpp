@@ -69,15 +69,21 @@ llm_build_qwen3moe::llm_build_qwen3moe(const llama_model & model, const llm_grap
                     model.layers[il].wo, model.layers[il].bo,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, 1.0f/sqrtf(float(n_embd_head)), il);
         }
-        if (il == n_layer - 1 && inp_out_ids) {
-            cur   = ggml_get_rows(ctx0,   cur, inp_out_ids);
-            inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
-        }
-        ggml_tensor * ffn_inp = ggml_add(ctx0, cur, inpSA);
-        cb(ffn_inp, "ffn_inp", il);
+        // Deferred PARTIAL fusion (Option B / Path B):
+        // Keep wo_partial as PARTIAL — do NOT add inpSA here. The meta backend lookahead
+        // (defer_attn_allreduce) will suppress the AllReduce boundary at wo_partial and
+        // defer it past the MoE block where both PARTIAL tensors are combined.
+        ggml_tensor * wo_partial = cur;  // PARTIAL (axis 0 from wo MUL_MAT SPLIT_AXIS_0)
 
-        // MoE branch
-        cur = build_norm(ffn_inp,
+        if (il == n_layer - 1 && inp_out_ids) {
+            wo_partial = ggml_get_rows(ctx0, wo_partial, inp_out_ids);
+            inpSA      = ggml_get_rows(ctx0,      inpSA, inp_out_ids);
+        }
+
+        // MoE branch: ffn_norm operates on inpSA (MIRRORED) — not on the wo output.
+        // Note: this is a mathematical change (Path B parallel-residual structure).
+        // ffn_norm(inpSA) != ffn_norm(wo_out + inpSA); numeric validation required (task 31).
+        cur = build_norm(inpSA,
                 model.layers[il].ffn_norm, NULL,
                 LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
@@ -95,9 +101,15 @@ llm_build_qwen3moe::llm_build_qwen3moe(const llama_model & model, const llm_grap
                     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
                     il);
         cb(moe_out, "ffn_moe_out", il);
-        cur = moe_out;
 
-        cur = ggml_add(ctx0, cur, ffn_inp);
+        // Combined PARTIAL+PARTIAL ADD: both wo_partial and moe_out are PARTIAL on axis 0.
+        // The meta backend defer_attn_allreduce lookahead defers the wo boundary to here.
+        // AllReduce fires at this ADD (combined boundary) — halves AllReduce count per layer.
+        ggml_tensor * combined_partial = ggml_add(ctx0, wo_partial, moe_out);
+        cb(combined_partial, "combined_partial", il);
+
+        // Final residual: combined_partial triggers AllReduce → MIRRORED, then + inpSA.
+        cur = ggml_add(ctx0, combined_partial, inpSA);
 
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
