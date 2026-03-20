@@ -126,16 +126,24 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         // EP: Expert tensors — split on expert dimension (axis 2)
         // Must match BEFORE non-_exps patterns below
         if (std::regex_match(tensor_name, pattern_ffn_up_gate_exps_weight)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+            auto tc = get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+            tc.rotation = 0; // EP: experts must map to contiguous global IDs per GPU
+            return tc;
         }
         if (std::regex_match(tensor_name, pattern_ffn_down_exps_weight)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+            auto tc = get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+            tc.rotation = 0;
+            return tc;
         }
         if (std::regex_match(tensor_name, pattern_ffn_up_gate_exps_bias)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+            auto tc = get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+            tc.rotation = 0;
+            return tc;
         }
         if (std::regex_match(tensor_name, pattern_ffn_down_exps_bias)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+            auto tc = get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+            tc.rotation = 0;
+            return tc;
         }
 
         // TP: Non-expert FFN tensors — split on weight dimensions

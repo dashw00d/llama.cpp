@@ -931,9 +931,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     //   [3] = EP flag (1 = EP mode, backend must zero output before compute)
                     // EP layout: [1]=expert_offset, [2]=n_local_experts
                     // [0] preserved (precision). Phase 3 reads [1] and [2].
+                    // EP layout: [1]=expert_offset, [2]=n_local_experts (>0 signals EP mode)
                     bcj.nodes[i]->op_params[1] = expert_offset;
                     bcj.nodes[i]->op_params[2] = n_local_experts;
-                    bcj.nodes[i]->op_params[3] = 1; // EP mode: backend must pre-zero output
                 }
             }
         }
