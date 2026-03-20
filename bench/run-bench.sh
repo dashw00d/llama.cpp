@@ -23,7 +23,8 @@ case "$MODEL_NAME" in
   0.6b)     MODEL="/home/ryan/llm-stack/models/Qwen/Qwen3-0.6B-GGUF/Qwen3-0.6B-Q8_0.gguf" ;;
   30b-moe)  MODEL="/home/ryan/llm-stack/models/Qwen/Qwen3-30B-A3B-abliterated-GGUF/qwen3-30b-a3b-abliterated-q4_k_m.gguf" ;;
   30b-ream) MODEL="/home/ryan/llm-stack/models/Qwen/Qwen3-30B-A3B-REAM-heretic-i1-GGUF/Qwen3-30B-A3B-REAM-heretic-i1-Q4_K_M.gguf" ;;
-  *)        echo "Unknown model: $MODEL_NAME (use 0.6b, 30b-moe, 30b-ream)"; exit 1 ;;
+  2.7b-moe) MODEL="/home/ryan/llm-stack/models/Qwen/Qwen1.5-MoE-A2.7B-Chat-GGUF/Qwen1.5-MoE-A2.7B-Chat.Q2_K.gguf" ;;
+  *)        echo "Unknown model: $MODEL_NAME (use 0.6b, 2.7b-moe, 30b-moe, 30b-ream)"; exit 1 ;;
 esac
 
 # Config env vars
@@ -84,7 +85,7 @@ echo "Warmup (3 sequential)..."
 for i in 1 2 3; do
     curl -s --max-time 300 -X POST "http://127.0.0.1:$PORT/v1/chat/completions" \
         -H 'Content-Type: application/json' \
-        -d "{\"model\":\"bench\",\"messages\":[{\"role\":\"user\",\"content\":\"Say hello\"}],\"max_tokens\":10}" > /dev/null 2>&1
+        -d "{\"model\":\"bench\",\"messages\":[{\"role\":\"user\",\"content\":\"Say hello\"}],\"max_tokens\":10}" > /dev/null 2>/dev/null
 done
 echo "Warmup done"
 
@@ -106,7 +107,7 @@ for i in $(seq 1 "$NP"); do
     curl -s --max-time 300 -X POST "http://127.0.0.1:$PORT/v1/chat/completions" \
         -H 'Content-Type: application/json' \
         -d "{\"model\":\"bench\",\"messages\":[{\"role\":\"user\",\"content\":\"$PROMPT\"}],\"max_tokens\":$MAX_TOKENS}" \
-        > "/tmp/bench_r${i}.json" 2>&1 &
+        > "/tmp/bench_r${i}.json" 2>/dev/null &
 done
 wait
 BENCH_END=$(date +%s%N)
