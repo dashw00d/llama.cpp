@@ -934,6 +934,21 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     // EP layout: [1]=expert_offset, [2]=n_local_experts (>0 signals EP mode)
                     bcj.nodes[i]->op_params[1] = expert_offset;
                     bcj.nodes[i]->op_params[2] = n_local_experts;
+                    // DEBUG: confirm EP params are being set (first gate_exps only, all backends)
+                    static bool ep_first_printed = false;
+                    if (!ep_first_printed && strstr(node->src[0]->name, "ffn_gate_exps") != nullptr) {
+                        fprintf(stderr, "EP META SET [j=%zu, node=%s]: expert_offset=%d n_local=%d\n",
+                                j, node->src[0]->name, expert_offset, n_local_experts);
+                        if (j + 1 == n_backends) ep_first_printed = true;
+                    }
+                } else {
+                    static bool not_ep_printed = false;
+                    if (!not_ep_printed) {
+                        not_ep_printed = true;
+                        fprintf(stderr, "EP META SKIP [j=%zu, node=%s]: src0_axis=%s (not SPLIT_AXIS_2)\n",
+                                j, node->src[0]->name,
+                                ggml_backend_meta_split_axis_name(src0_ss.axis));
+                    }
                 }
             }
         }
@@ -1009,6 +1024,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             return idr;
         };
 
+        const bool debug_splits = getenv("GGML_META_DEBUG_SPLITS") != nullptr;
+        size_t n_boundaries = 0;
+
         int i_start = 0;
         for (int i = 0; i < cgraph->n_nodes; i++) {
             ggml_tensor * node = cgraph->nodes[i];
@@ -1019,6 +1037,12 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 GGML_ASSERT(ggml_backend_meta_get_split_state(node->src[1], /*assume_sync =*/ false).axis != GGML_BACKEND_SPLIT_AXIS_PARTIAL);
             }
             const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(node, /*assume_sync =*/ false);
+
+            if (debug_splits) {
+                fprintf(stderr, "[META_SPLITS] node[%d] op=%-20s axis=%s\n",
+                        i, ggml_op_name(node->op),
+                        ggml_backend_meta_split_axis_name(split_state.axis));
+            }
 
             // EP subgraph merging: when an EP MUL_MAT_ID produces PARTIAL, check if
             // there's another EP MUL_MAT_ID ahead in the same MoE block. If so, defer
@@ -1054,6 +1078,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 }
             }
 
+            if (debug_splits && split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+                fprintf(stderr, "[META_SPLITS]   PARTIAL node[%d] defer_ep_allreduce=%s\n",
+                        i, defer_ep_allreduce ? "true" : "false");
+            }
+
             if (!defer_ep_allreduce && split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
                 max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node));
             }
@@ -1063,7 +1092,19 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 continue;
             }
 
-            i = get_i_delayed(i);
+            {
+                const int i_orig = i;
+                i = get_i_delayed(i);
+                ggml_tensor * delayed_node = cgraph->nodes[i];
+                fprintf(stderr, "EP ALLREDUCE [get_i_delayed]: tensor=%s, i=%d, delayed_i=%d, extended=%s\n",
+                        delayed_node->name, i_orig, i, (i > i_orig) ? "YES" : "NO");
+            }
+
+            if (debug_splits && split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+                fprintf(stderr, "[META_SPLITS] --- boundary at node[%d]: new subgraph #%zu starts at node[%d]\n",
+                        i, n_subgraphs + 1, i + 1);
+                n_boundaries++;
+            }
 
             for (size_t j = 0; j < n_backends; j++) {
                 auto & bcj = backend_ctx->backend_configs[j];
@@ -1073,6 +1114,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             i_start = i + 1;
         }
         GGML_ASSERT(i_start == cgraph->n_nodes);
+
+        if (debug_splits) {
+            fprintf(stderr, "[META_SPLITS] summary: n_subgraphs=%zu, n_boundaries=%zu\n",
+                    n_subgraphs, n_boundaries);
+        }
     }
 
     if (max_tmp_size > backend_ctx->max_tmp_size) {
@@ -1261,6 +1307,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     backends.push_back(bcj.backend);
                     ggml_cgraph * cgraph_ij = bcj.cgraphs[i].cgraph_main;
                     nodes.push_back(cgraph_ij->nodes[cgraph_ij->n_nodes-1]);
+                }
+                {
+                    ggml_cgraph * cgraph_i0 = backend_ctx->backend_configs[0].cgraphs[i].cgraph_main;
+                    ggml_tensor * allreduce_node = cgraph_i0->nodes[cgraph_i0->n_nodes-1];
+                    fprintf(stderr, "EP ALLREDUCE EXEC: tensor=%s\n", allreduce_node->name);
                 }
                 backend_allreduce_success = allreduce_tensor(backends.data(), nodes.data(), n_backends);
             }

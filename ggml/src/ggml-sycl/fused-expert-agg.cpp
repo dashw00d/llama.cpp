@@ -128,6 +128,15 @@ int try_fused_expert_agg(ggml_backend_sycl_context & ctx, ggml_tensor ** nodes, 
     GGML_SYCL_DEBUG("[SYCL] fused expert agg: n_embd=%ld, n_expert_used=%ld, n_tokens=%ld, replacing %d nodes (1 MUL + %d VIEWs + %d ADDs)\n",
                     (long)n_embd, (long)n_expert_used, (long)n_tokens,
                     1 + n_views + n_adds, n_views, n_adds);
+    {
+        static bool fused_agg_printed = false;
+        if (!fused_agg_printed) {
+            fused_agg_printed = true;
+            fprintf(stderr, "FUSED_AGG [%s] dev=%d n_embd=%ld n_exp=%ld n_tok=%ld mul_name=%s experts=%p last_add=%p\n",
+                    mul_node->name, ctx.device, (long)n_embd, (long)n_expert_used, (long)n_tokens,
+                    mul_node->name, (void*)experts_data, (void*)output_data);
+        }
+    }
 
     stream->parallel_for(
         sycl::nd_range<1>(n_groups * wg_size, wg_size),

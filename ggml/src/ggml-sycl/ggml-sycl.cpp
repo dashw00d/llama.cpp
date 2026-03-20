@@ -4204,6 +4204,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     // from non-EP mode without an explicit flag.
     const bool    ep_flag          = (dst->op_params[2] > 0); // n_local_experts > 0 means EP mode
 
+    // DEBUG: print EP state for first MUL_MAT_ID calls
+    {
+        static int sycl_ep_debug_count = 0;
+        if (sycl_ep_debug_count < 12) {
+            sycl_ep_debug_count++;
+            fprintf(stderr, "SYCL MUL_MAT_ID [%s] device=%d ep_flag=%d expert_offset=%d n_local=%ld ne02=%ld op_params={%d,%d,%d}\n",
+                    src0->name, ctx.device, (int)ep_flag, expert_offset, (long)n_local_experts, (long)ne02,
+                    dst->op_params[0], dst->op_params[1], dst->op_params[2]);
+        }
+    }
+
     // --- Pre-zero output for EP mode ---
     // Non-owned expert output slots must be zero for correct AllReduce SUM.
     // In non-EP mode this is a no-op cost we skip entirely.
@@ -6393,6 +6404,18 @@ static bool ggml_backend_sycl_allreduce_tensor(
     auto do_host_reduction = [&]() {
         for (size_t i = 0; i < n_backends; ++i) {
             d2h_events[i].wait();
+        }
+        // AR VALUE DEBUG: print first few floats from each GPU before reduction (first 2 allreduces only)
+        if (ar_count <= 2) {
+            fprintf(stderr, "AR #%d [%s] ne=%ld n_backends=%zu\n",
+                    ar_count, tensors[0]->name, (long)ne, n_backends);
+            for (size_t i = 0; i < n_backends; ++i) {
+                fprintf(stderr, "  GPU%zu first 8 floats: ", i);
+                for (int k = 0; k < 8 && k < ne; ++k) fprintf(stderr, "%.4f ", host_bufs[i][k]);
+                int nz = 0;
+                for (int64_t k = 0; k < ne; ++k) if (host_bufs[i][k] != 0.0f) nz++;
+                fprintf(stderr, "... nonzeros=%d/%ld\n", nz, (long)ne);
+            }
         }
         // Fused 3-way sum for common n_backends=3 case — single pass halves memory traffic
         float * __restrict__ acc = host_bufs[0];
