@@ -16,11 +16,20 @@ These are gaps, anomalies, and untested optimizations identified during the Marc
 - TP on the same REAM model produces clean output at 296ms / 3.38 t/s
 - EP code touches 3 files: `llama-model.cpp`, `ggml-backend-meta.cpp`, `ggml-sycl.cpp`
 
-**Likely suspects:**
-1. Expert index remapping: `expert_id - expert_offset` to get local index — off-by-one or wrong offset?
-2. Output pre-zeroing: `memset(dst, 0, ...)` may be zeroing at wrong time or wrong size
-3. op_params encoding: Phase 2 writes `[1]=expert_offset, [2]=n_local_experts`, Phase 3 reads same — but are they reading the RIGHT tensor's op_params? (simple tensor vs original?)
-4. AllReduce SUM: zeros from non-owned experts + real values from owned experts — is the SUM actually correct? Could be double-counting or missing contributions.
+**ROOT CAUSE FOUND (2026-03-19 21:24):**
+
+Expert tensor rotation breaks EP offset calculation. The meta backend uses `rotation = il % n_devices` to load-balance tensor shards across GPUs per layer. For EP, this means:
+- Layer 0 (rotation=0): GPU0 has experts 0-31, told offset=0 ✅
+- Layer 1 (rotation=1): GPU0 has experts 64-95, told offset=0 ❌
+- Layer 2 (rotation=2): GPU0 has experts 32-63, told offset=0 ❌
+
+Only 16/48 MoE layers (rotation=0) work correctly. The other 32 output all-zeros.
+
+**Fix:** Force `rotation=0` for EP expert tensors in `llama-model.cpp`. EP doesn't benefit from rotation.
+
+**Secondary bug:** op_params slot mismatch (Phase 2 writes EP flag to [3], Phase 3 reads [2]) — works by coincidence because n_local_experts > 0 is truthy. Should be cleaned up.
+
+Full analysis: `/home/ryan/.openclaw/workspace/outputs/oq1-ep-corruption-clues.md`
 
 **Test plan:**
 1. Add debug logging to Phase 3 SYCL code: print expert_offset, n_local for each GPU
