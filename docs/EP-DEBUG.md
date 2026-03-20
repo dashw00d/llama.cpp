@@ -55,22 +55,22 @@ With 96 experts, 3 GPUs → each GPU gets 32 experts as a contiguous [hidden, in
 
 ## Investigated Root Causes
 
-### Theory 1: Tensor Rotation (TESTED — DID NOT FIX)
-**Hypothesis:** `rotation = il % n_devices` in `get_tensor_config_impl` rotates which GPU physically holds which experts per layer. Meta backend computes `expert_offset` without accounting for rotation → wrong offsets on 2/3 of layers.
+### Theory 1: Tensor Rotation (DEBUNKED)
+**Hypothesis:** Rotation scrambles expert-to-GPU mapping per layer.
 
-**Fix applied:** `tc.rotation = 0` for all EP expert tensors in `llama-model.cpp`.
+**Debunked by Opus analysis:** With 96 experts / 3 GPUs, all `ne[j]=32` (equal). Rotation shuffles identical values — it's a no-op. `set_tensor` always distributes data sequentially: GPU0=experts 0-31, GPU1=32-63, GPU2=64-95, regardless of rotation. The fix (`rotation=0`) was applied but is a no-op for equal splits.
 
-**Result:** Still garbled. Either rotation isn't the root cause, or it's one of multiple bugs.
-
-**Why it might not be the issue:** The `expert_offset` calculation in meta backend uses `src0_ss.ne[k]` which may already account for which GPU physically has which data in the rotated frame. Need to verify by tracing through `calculate_split_state` → `simple_tensor_init` → what physical data each GPU's `ne02` actually represents.
+**Still applies IF:** Model has `n_expert % n_devices != 0` (unequal splits).
 
 ### Theory 2: op_params Slot Mismatch (LATENT BUG — works by coincidence)
 Phase 2 writes `[3]=EP flag`, Phase 3 reads `[2]>0` as EP flag. Works because `n_local_experts=32 > 0` is truthy. Not the corruption cause but should be cleaned up.
 
-### Theory 3: ne02 vs n_local_experts
+### Theory 3: ne02 vs n_local_experts (TOP SUSPECT)
 Phase 3 reads `n_local_experts` from `ne02` (tensor shape dimension 2), NOT from `op_params[2]`. If `ne02` on the simple (per-GPU) tensor is 32 (correct), this works. If `ne02` is still 96 (global), then expert filtering passes all experts but local indexing overflows the 32-expert buffer.
 
-**THIS IS THE MOST LIKELY REMAINING SUSPECT.** Check:
+**Opus analysis says code is correct**, but EP output IS garbled (confirmed side-by-side: TP=clean, EP=garbage on same model+prompt). Something in the actual runtime data flow is wrong even if the code reads correctly.
+
+**THIS IS THE TOP SUSPECT.** Check:
 ```bash
 # Add debug print to ggml_sycl_mul_mat_id:
 # printf("EP: ne02=%ld expert_offset=%d n_local=%ld\n", ne02, expert_offset, n_local_experts);
