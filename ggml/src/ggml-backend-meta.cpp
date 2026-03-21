@@ -1477,11 +1477,19 @@ struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const str
     auto handle_mul_mat_id = [&](const std::vector<ggml_backend_meta_split_state> & src_split_states) -> ggml_backend_meta_split_state {
         if (src_split_states[0].axis == GGML_BACKEND_SPLIT_AXIS_2) {
             // EP mode: src0 (expert weights) split on axis 2 (expert dimension)
-            // src1 (activations) should be MIRRORED, src2 (routing ids) should be MIRRORED
-            GGML_ASSERT(src_split_states[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            // src1 (activations): MIRRORED for gate/up (first MUL_MAT_ID in MoE block),
+            //                     PARTIAL for down (after GLU combines gate+up outputs)
+            // src2 (routing ids) should be MIRRORED
+            GGML_ASSERT(src_split_states[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
+                        src_split_states[1].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL);
             GGML_ASSERT(src_split_states[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
             // Output is PARTIAL: each GPU computes full results for owned experts, zeros for others.
             // AllReduce SUM will combine them correctly (zeros + real values = real values).
+            // Output is PARTIAL during compute (each GPU has partial results).
+            // With assume_sync=true (used by buffer_init_tensor), return MIRRORED
+            // because weights are fully synced after AllReduce.
+            // With assume_sync=false (used by subgraph sweep), return PARTIAL
+            // so downstream ops (GLU, MUL) propagate the split state correctly.
             return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}};
         }
         // Non-EP MUL_MAT_ID: fall through to regular TP handle_mul_mat
@@ -1613,7 +1621,11 @@ struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const str
                 src_split_states[i] = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}};
                 continue;
             }
-            src_split_states[i] = ggml_backend_meta_get_split_state(tensor->src[i], /*assume_sync =*/ true);
+            // For GLU ops, resolve sources with assume_sync=false so EP MUL_MAT_ID
+            // outputs return PARTIAL (not MIRRORED). This lets GLU propagate PARTIAL
+            // through the MoE block. All other ops use assume_sync=true (standard).
+            const bool sync_for_src = (tensor->op != GGML_OP_GLU);
+            src_split_states[i] = ggml_backend_meta_get_split_state(tensor->src[i], /*assume_sync =*/ sync_for_src);
         }
 
         ggml_backend_meta_split_state split_state;
@@ -1783,9 +1795,24 @@ struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const str
                 split_state = handle_per_row(src_split_states);
             } break;
             case GGML_OP_OPT_STEP_ADAMW:
-            case GGML_OP_OPT_STEP_SGD:
-            case GGML_OP_GLU: {
+            case GGML_OP_OPT_STEP_SGD: {
                 split_state = handle_generic(src_split_states, /*scalar_only =*/ false);
+            } break;
+            case GGML_OP_GLU: {
+                // In EP MoE, GLU's inputs come from MUL_MAT_ID with SPLIT_AXIS_2 expert weights.
+                // Output should be PARTIAL → AllReduce merges gate/up activations per expert.
+                // If any source is PARTIAL, return PARTIAL directly without checking ne consistency.
+                // The ne values may differ for GLU inputs (gate vs up projections) but the
+                // element-wise multiply doesn't care about shape — it just multiplies per-element.
+                for (size_t i = 0; i < GGML_MAX_SRC; i++) {
+                    if (tensor->src[i] != nullptr && src_split_states[i].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+                        split_state = src_split_states[i];
+                        break;
+                    }
+                }
+                if (split_state.axis != GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+                    split_state = handle_generic(src_split_states, false);
+                }
             } break;
             default: {
                 GGML_ABORT("ggml op not implemented: %s", ggml_op_name(tensor->op));
