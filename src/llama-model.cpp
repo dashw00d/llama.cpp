@@ -124,17 +124,20 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         // }
 
         // EP: Expert tensors split on expert dimension (axis 2)
-        if (std::regex_match(tensor_name, pattern_ffn_up_gate_exps_weight)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
-        }
-        if (std::regex_match(tensor_name, pattern_ffn_down_exps_weight)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
-        }
-        if (std::regex_match(tensor_name, pattern_ffn_up_gate_exps_bias)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
-        }
-        if (std::regex_match(tensor_name, pattern_ffn_down_exps_bias)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+        // Can be disabled with GGML_NO_EP=1 for debugging (falls through to MIRRORED)
+        if (getenv("GGML_NO_EP") == nullptr) {
+            if (std::regex_match(tensor_name, pattern_ffn_up_gate_exps_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+            }
+            if (std::regex_match(tensor_name, pattern_ffn_down_exps_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+            }
+            if (std::regex_match(tensor_name, pattern_ffn_up_gate_exps_bias)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+            }
+            if (std::regex_match(tensor_name, pattern_ffn_down_exps_bias)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+            }
         }
 
         // TP: Non-expert FFN tensors — split on weight dimensions
@@ -152,13 +155,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
 
         // output
+        // MIRRORED: replicate output weights on all GPUs so logits are not split.
+        // Split logits break backend sampling (each GPU only sees partial vocab).
+        // TODO: implement logits gathering for SPLIT_AXIS_0 to save VRAM.
         if (std::regex_match(tensor_name, pattern_output_weight)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
         if (std::regex_match(tensor_name, pattern_output_bias)) {
-            const ggml_tensor * output_weight = ud->model->get_tensor("output.weight");
-            GGML_ASSERT(output_weight != nullptr);
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
 
         // everything else
@@ -212,10 +216,17 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         const int64_t granularity = get_split_granularity(blck_size);
         GGML_ASSERT(ne_full % granularity == 0);
         const float * tensor_split = ud->model->tensor_split();
+        // For SPLIT_AXIS_2 (EP expert dimension), disable rotation entirely.
+        // Rotation breaks expert_offset/n_local calculation — the meta backend
+        // computes expert_offset = sum(ne[0..j-1]) which must be consistent
+        // across all layers. With rotation, layer 0 might have GPU1 owning
+        // experts 42-84 but layer 1 has GPU1 owning experts 43-84.
+        const bool is_ep_split = (split_state.axis == GGML_BACKEND_SPLIT_AXIS_2);
+        const size_t effective_rotation = is_ep_split ? 0 : tc.rotation;
         std::vector<float> tensor_split_scan;
         tensor_split_scan.reserve(ud->n_devices);
         for (size_t j = 0; j < ud->n_devices; j++) {
-            tensor_split_scan.push_back(tensor_split == nullptr ? 0.0f : tensor_split[(j + tc.rotation) % ud->n_devices]);
+            tensor_split_scan.push_back(tensor_split == nullptr ? 0.0f : tensor_split[(j + effective_rotation) % ud->n_devices]);
             if (j > 0) {
                 tensor_split_scan[j] += tensor_split_scan[j - 1];
             }
@@ -228,10 +239,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (high % granularity != 0) {
                 high -= high % granularity;
             }
-            split_state.ne[(j + tc.rotation) % ud->n_devices] = high - low;
+            split_state.ne[(j + effective_rotation) % ud->n_devices] = high - low;
             low = high;
         }
-        split_state.ne[(j + tc.rotation) % ud->n_devices] = ne_full - low;
+        split_state.ne[(j + effective_rotation) % ud->n_devices] = ne_full - low;
     } else {
         memset(split_state.ne, 0, sizeof(split_state.ne));
     }

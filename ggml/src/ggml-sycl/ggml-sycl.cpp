@@ -4311,7 +4311,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     dst_row.ne[3] = 1;
     dst_row.nb[2] = nb1;
     dst_row.nb[3] = nb1;
-    if (true) { // Force simple per-expert path for debugging (was: ne12 == 1)
+    if (ne12 == 1) { // Decode path: process one token at a time per expert
         // DEBUG: dump routing for first few EP MUL_MAT_ID calls
         {
             static int route_debug_count = 0;
@@ -6487,6 +6487,28 @@ static bool ggml_backend_sycl_allreduce_tensor(
     for (size_t i = 0; i < n_backends; ++i) {
         ggml_backend_sycl_context * ctx = (ggml_backend_sycl_context *)backends[i]->context;
         SYCL_CHECK(CHECK_TRY_ERROR(ctx->stream(ctx->device, 0)->wait()));
+    }
+
+    // POST-AR VERIFICATION: read back from all GPUs and check they match
+    {
+        static int post_ar_check = 0;
+        if (post_ar_check < 200) {
+            post_ar_check++;
+            std::vector<float> readback(ne);
+            fprintf(stderr, "POST_AR #%d [%s] ne=%" PRId64 ":\n", post_ar_check, tensors[0]->name, ne);
+            for (size_t i = 0; i < n_backends; ++i) {
+                ggml_backend_sycl_context * ctx = (ggml_backend_sycl_context *)backends[i]->context;
+                const queue_ptr stream = ctx->stream(ctx->device, 0);
+                stream->memcpy(readback.data(), tensors[i]->data, nbytes).wait();
+                float sum = 0, absmax = 0;
+                for (int64_t j = 0; j < ne; j++) {
+                    sum += readback[j];
+                    if (fabsf(readback[j]) > absmax) absmax = fabsf(readback[j]);
+                }
+                fprintf(stderr, "  GPU%zu: [%.4f,%.4f,%.4f,%.4f] sum=%.2f absmax=%.4f\n",
+                        i, readback[0], readback[1], readback[2], readback[3], sum, absmax);
+            }
+        }
     }
 
     if (do_timing) {
