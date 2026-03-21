@@ -85,7 +85,7 @@ echo "Warmup (3 sequential)..."
 for i in 1 2 3; do
     curl -s --max-time 300 -X POST "http://127.0.0.1:$PORT/v1/chat/completions" \
         -H 'Content-Type: application/json' \
-        -d "{\"model\":\"bench\",\"messages\":[{\"role\":\"user\",\"content\":\"Say hello\"}],\"max_tokens\":10}" > /dev/null 2>/dev/null
+        -d "{\"model\":\"bench\",\"messages\":[{\"role\":\"user\",\"content\":\"Say hello\"}],\"max_tokens\":10}" > /dev/null 2>/dev/null || true
 done
 echo "Warmup done"
 

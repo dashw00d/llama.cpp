@@ -1,0 +1,25 @@
+{
+  "timestamp": "2026-03-19_224157",
+  "model": "30b-ream",
+  "config": "immediate",
+  "np": 1,
+  "max_tokens": 100,
+  "context": 512,
+  "load_time_s": 10,
+  "wall_time_ms": 116108,
+  "aggregate_tps": 2.394460157823179,
+  "per_user_tps": 2.394460157823179,
+  "clean_slots": 1,
+  "garbled_slots": 0,
+  "total_tokens": 100,
+  "slots": [
+    {
+      "slot": 1,
+      "ms_per_tok": 417.63067,
+      "tps": 2.394460157823179,
+      "tokens": 100,
+      "status": "clean",
+      "content_preview": "Mathematics is a profound and ancient discipline that explor"
+    }
+  ]
+}

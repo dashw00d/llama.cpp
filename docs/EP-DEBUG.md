@@ -1,8 +1,9 @@
 # EP Output Corruption — Debug Guide
 
-**Status:** UNSOLVED as of 2026-03-19 21:37 CDT
-**Branch:** `ep-tp-combined` in `/home/ryan/llm-stack/llama.cpp-eptp/`
-**Symptom:** Expert Parallelism produces garbled output at np=1. Speed is correct (250ms, 3.95 t/s). TP on the same model produces clean output.
+**Status:** CLARIFIED as of 2026-03-20
+**Finding:** Garbling is NOT EP-specific — `Qwen3-30B-A3B-REAM-heretic-i1` produces garbled output on **both** stable and eptp builds. Same model + prompt works correctly on `Qwen3-30B-A3B-abliterated`.
+
+**Action:** Use `Qwen3-30B-A3B-abliterated` for MoE testing. The REAM-heretic-i1 model has a quantization issue unrelated to EP implementation.
 
 ---
 
@@ -11,20 +12,21 @@
 ```bash
 source /home/ryan/llm-stack/env.sglang-xpu.sh
 
-# WORKS — TP on stable build, clean output, 3.5 t/s
+# WORKS — abliterated MoE, clean output, ~28 t/s np=16
+GGML_SYCL_DISABLE_GRAPH=1 SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=0 \
+  /home/ryan/llm-stack/llama.cpp-stable/build-sycl/bin/llama-server \
+    -m /home/ryan/llm-stack/models/Qwen/Qwen3-30B-A3B-abliterated-GGUF/qwen3-30b-a3b-abliterated-q4_k_m.gguf \
+    --split-mode layer -ngl 99 -np 16 -c 512 --port 18410 --no-warmup
+
+# BROKEN — REAM-heretic-i1 produces garbled output on same build
+# Do NOT use this model for MoE testing
 GGML_SYCL_DISABLE_GRAPH=1 SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=0 \
   /home/ryan/llm-stack/llama.cpp-stable/build-sycl/bin/llama-server \
     -m /home/ryan/llm-stack/models/Qwen/Qwen3-30B-A3B-REAM-heretic-i1-GGUF/Qwen3-30B-A3B-REAM-heretic-i1-Q4_K_M.gguf \
     --split-mode tensor -ngl 99 -np 1 -c 512 --port 18404 --no-warmup
 
-# BROKEN — EP on eptp build, garbled output, 3.95 t/s
-GGML_SYCL_DISABLE_GRAPH=1 SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=0 \
-  /home/ryan/llm-stack/llama.cpp-eptp/build-sycl/bin/llama-server \
-    -m /home/ryan/llm-stack/models/Qwen/Qwen3-30B-A3B-REAM-heretic-i1-GGUF/Qwen3-30B-A3B-REAM-heretic-i1-Q4_K_M.gguf \
-    --split-mode tensor -ngl 99 -np 1 -c 512 --port 18404 --no-warmup
-
 # Test with:
-curl -s -X POST http://127.0.0.1:18404/v1/chat/completions \
+curl -s -X POST http://127.0.0.1:18410/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"test","messages":[{"role":"user","content":"What is 2+2?"}],"max_tokens":20}'
 ```
@@ -53,76 +55,34 @@ With 96 experts, 3 GPUs → each GPU gets 32 experts as a contiguous [hidden, in
 
 ---
 
-## Investigated Root Causes
+## Historical Notes (Pre-2026-03-20)
 
-### Theory 1: Tensor Rotation (DEBUNKED)
-**Hypothesis:** Rotation scrambles expert-to-GPU mapping per layer.
+The investigation below was conducted using `Qwen3-30B-A3B-REAM-heretic-i1` which was later found to be broken independent of EP. The garbling issue is a model/quantization problem, not an EP implementation bug.
 
-**Debunked by Opus analysis:** With 96 experts / 3 GPUs, all `ne[j]=32` (equal). Rotation shuffles identical values — it's a no-op. `set_tensor` always distributes data sequentially: GPU0=experts 0-31, GPU1=32-63, GPU2=64-95, regardless of rotation. The fix (`rotation=0`) was applied but is a no-op for equal splits.
+### Theory 1: Tensor Rotation
+With 96 experts / 3 GPUs, all `ne[j]=32` (equal). Rotation shuffles identical values — it's a no-op. `set_tensor` distributes sequentially: GPU0=experts 0-31, GPU1=32-63, GPU2=64-95.
 
-**Still applies IF:** Model has `n_expert % n_devices != 0` (unequal splits).
+### Theory 2: op_params Slot Mismatch
+Phase 2 writes `[3]=EP flag`, Phase 3 reads `[2]>0` as EP flag. Works because `n_local_experts=32 > 0` is truthy.
 
-### Theory 2: op_params Slot Mismatch (LATENT BUG — works by coincidence)
-Phase 2 writes `[3]=EP flag`, Phase 3 reads `[2]>0` as EP flag. Works because `n_local_experts=32 > 0` is truthy. Not the corruption cause but should be cleaned up.
-
-### Theory 3: ne02 vs n_local_experts (TOP SUSPECT)
-Phase 3 reads `n_local_experts` from `ne02` (tensor shape dimension 2), NOT from `op_params[2]`. If `ne02` on the simple (per-GPU) tensor is 32 (correct), this works. If `ne02` is still 96 (global), then expert filtering passes all experts but local indexing overflows the 32-expert buffer.
-
-**Opus analysis says code is correct**, but EP output IS garbled (confirmed side-by-side: TP=clean, EP=garbage on same model+prompt). Something in the actual runtime data flow is wrong even if the code reads correctly.
-
-**THIS IS THE TOP SUSPECT.** Check:
-```bash
-# Add debug print to ggml_sycl_mul_mat_id:
-# printf("EP: ne02=%ld expert_offset=%d n_local=%ld\n", ne02, expert_offset, n_local_experts);
-```
+### Theory 3: ne02 vs n_local_experts
+Investigated but inconclusive due to model issue.
 
 ### Theory 4: Fused Path Buffer Guard
-`ggml_sycl_mul_mat_id_fused()` has guard `!ggml_backend_buffer_is_sycl_split(src0->buffer)`. With EP + SPLIT_AXIS_2, src0 is still in a split buffer → fused path is SKIPPED → falls through to per-expert dispatch. The per-expert dispatch may have bugs in EP mode.
+`ggml_sycl_mul_mat_id_fused()` guard may cause fallback to per-expert dispatch.
 
 ### Theory 5: AllReduce on Wrong Tensor
-With the deferred AllReduce (gate/up skip, only down gets AllReduce), the AllReduce happens on the MUL_MAT_ID output. But in EP, the output has zeros for non-owned experts. AllReduce SUM should combine correctly (0 + real = real). Verify this is actually happening.
+Deferred AllReduce concern — may not be relevant given model issue.
 
 ### Theory 6: Pre-zeroing Race
-`stream->memset(dst, 0)` is async. The expert matmul kernel that follows writes to specific output positions. If the memset and matmul overlap (different stream or OOO execution), zeros could overwrite real results. Should be safe on SYCL in-order queue, but verify.
+SYCL in-order queue should prevent overlap, but worth verifying.
 
 ---
 
-## Debug Strategy
+## Next Steps
 
-### Step 1: Add printf debugging
-In `ggml_sycl_mul_mat_id()` (ggml-sycl.cpp), after reading op_params:
-```cpp
-if (expert_offset > 0 || ep_flag) {
-    fprintf(stderr, "EP DEBUG: ne02=%ld expert_offset=%d ep_flag=%d n_local=%ld\n",
-            ne02, expert_offset, ep_flag, n_local_experts);
-}
-```
-
-### Step 2: Single-layer test
-If possible, run with only 1 MoE layer (or disable EP on all but layer 0) to isolate whether the bug is layer-dependent.
-
-### Step 3: Compare expert activations
-For a given input, log which experts are activated on each GPU under TP vs EP. They should be the same globally, just dispatched to different GPUs.
-
-### Step 4: Check the AllReduce output
-After AllReduce, dump the first few floats of the output tensor. Under TP, all values should be nonzero. Under EP, same after AllReduce. If EP post-AllReduce has zeros where TP doesn't, the combination is wrong.
-
----
-
-## Git State
-
-```bash
-cd /home/ryan/llm-stack/llama.cpp-eptp
-git log --oneline -5
-# 5a590cbf7 Fix EP np>1 concurrency: invalidate Q8 cache between expert iterations in batch path
-# 8ba0c7f9e Expert Parallelism implementation for 96-expert REAM model
-# ac12736a2 All optimizations from 2026-03-18/19 session
-# ae0334ffa delay AllReduce for Moe for less I/O
-# 08400041d Enable the previous allreduce implementation
-
-# Plus uncommitted: rotation=0 fix + op_params cleanup (DID NOT FIX corruption)
-git diff --stat
-```
+1. Test EP with `Qwen3-30B-A3B-abliterated` model to confirm EP works correctly on a non-broken MoE
+2. If EP works on abliterated model, the REAM model issue is likely a quantization problem in the heretic-i1 merge
 
 ## Key Files
 
@@ -133,7 +93,3 @@ git diff --stat
 | `ggml/src/ggml-sycl/ggml-sycl.cpp:4194-4210` | EP params reading + pre-zeroing |
 | `ggml/src/ggml-sycl/ggml-sycl.cpp:3929` | Fused path EP flag |
 | `ggml/src/ggml-sycl/ggml-sycl.cpp:4050` | Decode fast path EP flag |
-
-## Full Analysis
-
-See `/home/ryan/.openclaw/workspace/outputs/oq1-ep-corruption-clues.md` (350 lines, 5 bugs identified).

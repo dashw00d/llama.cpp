@@ -1,0 +1,21 @@
+{
+  "timestamp": "2026-03-19_223106",
+  "model": "0.6b",
+  "config": "immediate",
+  "np": 1,
+  "max_tokens": 100,
+  "context": 512,
+  "load_time_s": 2,
+  "wall_time_ms": 677,
+  "aggregate_tps": 0,
+  "per_user_tps": 0.0,
+  "clean_slots": 0,
+  "garbled_slots": 0,
+  "total_tokens": 0,
+  "slots": [
+    {
+      "slot": 1,
+      "error": "Expecting value: line 1 column 1 (char 0)"
+    }
+  ]
+}

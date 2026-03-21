@@ -1,0 +1,25 @@
+{
+  "timestamp": "2026-03-19_223617",
+  "model": "30b-moe",
+  "config": "immediate",
+  "np": 1,
+  "max_tokens": 100,
+  "context": 512,
+  "load_time_s": 16,
+  "wall_time_ms": 160324,
+  "aggregate_tps": 2.3600030274118837,
+  "per_user_tps": 2.3600030274118837,
+  "clean_slots": 0,
+  "garbled_slots": 1,
+  "total_tokens": 100,
+  "slots": [
+    {
+      "slot": 1,
+      "ms_per_tok": 423.72826999999995,
+      "tps": 2.3600030274118837,
+      "tokens": 100,
+      "status": "GARBLED",
+      "content_preview": ""
+    }
+  ]
+}

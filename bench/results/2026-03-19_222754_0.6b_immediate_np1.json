@@ -1,0 +1,25 @@
+{
+  "timestamp": "2026-03-19_222754",
+  "model": "0.6b",
+  "config": "immediate",
+  "np": 1,
+  "max_tokens": 200,
+  "context": 512,
+  "load_time_s": 2,
+  "wall_time_ms": 56575,
+  "aggregate_tps": 13.623800943734315,
+  "per_user_tps": 13.623800943734315,
+  "clean_slots": 0,
+  "garbled_slots": 1,
+  "total_tokens": 200,
+  "slots": [
+    {
+      "slot": 1,
+      "ms_per_tok": 73.40095500000001,
+      "tps": 13.623800943734315,
+      "tokens": 200,
+      "status": "GARBLED",
+      "content_preview": ""
+    }
+  ]
+}
