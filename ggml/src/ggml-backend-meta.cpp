@@ -1044,36 +1044,37 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                         ggml_backend_meta_split_axis_name(split_state.axis));
             }
 
-            // EP subgraph merging: when an EP MUL_MAT_ID produces PARTIAL, check if
-            // there's another EP MUL_MAT_ID ahead in the same MoE block. If so, defer
-            // the AllReduce boundary — the zero structure is preserved through element-wise
-            // ops (SiLU, MUL), so only the last EP MUL_MAT_ID (down projection) needs it.
+            // EP subgraph merging: defer AllReduce for intermediate PARTIAL nodes.
+            // In an EP MoE block: gate(PARTIAL) → up(PARTIAL) → GLU(PARTIAL) → down(PARTIAL) → AllReduce.
+            // We defer the AllReduce until the LAST MUL_MAT_ID in the sequence (the down projection).
+            //
+            // Strategy: if this node is PARTIAL, check if there's another MUL_MAT_ID ahead
+            // that also operates on SPLIT_AXIS_2 expert tensors. If so, we're still in the
+            // middle of the MoE block — defer. This avoids peeking at intermediate ops (GLU etc.)
+            // whose split states depend on inputs that haven't been fully resolved yet.
             bool defer_ep_allreduce = false;
-            if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL &&
-                    node->op == GGML_OP_MUL_MAT_ID && node->src[0] != nullptr &&
-                    ggml_backend_buffer_is_meta(node->src[0]->buffer)) {
-                const ggml_backend_meta_split_state src0_ss = ggml_backend_meta_get_split_state(node->src[0], /*assume_sync =*/ true);
-                if (src0_ss.axis == GGML_BACKEND_SPLIT_AXIS_2) {
-                    // EP mode: look ahead for another EP MUL_MAT_ID in this MoE block
-                    for (int k = i + 1; k < cgraph->n_nodes && k < i + 60; k++) {
-                        ggml_tensor * future = cgraph->nodes[k];
-                        if (future->op == GGML_OP_MUL_MAT_ID && future->src[0] != nullptr &&
-                                ggml_backend_buffer_is_meta(future->src[0]->buffer)) {
-                            const ggml_backend_meta_split_state future_src0_ss =
-                                ggml_backend_meta_get_split_state(future->src[0], /*assume_sync =*/ true);
-                            if (future_src0_ss.axis == GGML_BACKEND_SPLIT_AXIS_2) {
-                                defer_ep_allreduce = true;
-                                break;
-                            }
+            if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL && i + 1 < cgraph->n_nodes) {
+                // Look ahead for another MUL_MAT_ID with SPLIT_AXIS_2 src0 in this MoE block
+                for (int peek = i + 1; peek < cgraph->n_nodes && peek <= i + 20; peek++) {
+                    ggml_tensor * pn = cgraph->nodes[peek];
+                    // Skip view nodes
+                    if (pn->view_src != nullptr && pn->view_src->op == GGML_OP_NONE && ggml_backend_buffer_is_host(pn->view_src->buffer)) {
+                        continue;
+                    }
+                    // If we hit another MUL_MAT_ID with SPLIT_AXIS_2 expert weights, defer
+                    if (pn->op == GGML_OP_MUL_MAT_ID && pn->src[0] != nullptr) {
+                        const ggml_backend_meta_split_state src0_state = ggml_backend_meta_get_split_state(pn->src[0], /*assume_sync =*/ true);
+                        if (src0_state.axis == GGML_BACKEND_SPLIT_AXIS_2) {
+                            defer_ep_allreduce = true;
+                            break;
                         }
-                        // If we hit a non-EP AllReduce point (regular MUL_MAT producing PARTIAL), stop
-                        if (future->op == GGML_OP_MUL_MAT) {
-                            const ggml_backend_meta_split_state future_ss =
-                                ggml_backend_meta_get_split_state(future, /*assume_sync =*/ false);
-                            if (future_ss.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
-                                break;
-                            }
-                        }
+                    }
+                    // If we hit a PARTIAL → MIRRORED boundary (non-MUL_MAT_ID PARTIAL consumer), stop
+                    // Element-wise ops between MUL_MAT_IDs (GLU, MUL, etc.) are fine to skip past
+                    if (pn->op == GGML_OP_MUL_MAT || pn->op == GGML_OP_ADD) {
+                        // Check if this is an AllReduce-triggering ADD (residual connection)
+                        // If both inputs are PARTIAL/MIRRORED mix, this is the end of the MoE block
+                        break;
                     }
                 }
             }

@@ -4227,7 +4227,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     // Try the fused multi-expert kernel first (decode path only).
     // This replaces N individual kernel launches with a single fused launch
     // and only does a tiny D2H copy (n_ids × 4 bytes instead of full ids tensor).
-    if (ne12 == 1 && ggml_sycl_mul_mat_id_fused(ctx, src0, src1, dst, ids,
+    // DISABLED for EP mode — fused path produces zeros on GPU0/GPU1 (debugging)
+    if (!ep_flag && ne12 == 1 && ggml_sycl_mul_mat_id_fused(ctx, src0, src1, dst, ids,
                                                   expert_offset, n_local_experts)) {
         return;
     }
@@ -4280,7 +4281,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         }
     }
 
-    if (ne12 == 1 && ggml_sycl_mul_mat_id_decode_fast_path(ctx, src0, src1, dst, ids, ids_host_ptr,
+    if (!ep_flag && ne12 == 1 && ggml_sycl_mul_mat_id_decode_fast_path(ctx, src0, src1, dst, ids, ids_host_ptr,
                                                              expert_offset, n_local_experts)) {
         return;
     }
@@ -4310,14 +4311,43 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     dst_row.ne[3] = 1;
     dst_row.nb[2] = nb1;
     dst_row.nb[3] = nb1;
-    if (ne12 == 1) {
+    if (true) { // Force simple per-expert path for debugging (was: ne12 == 1)
+        // DEBUG: dump routing for first few EP MUL_MAT_ID calls
+        {
+            static int route_debug_count = 0;
+            if (route_debug_count < 6 && ep_flag) {
+                route_debug_count++;
+                fprintf(stderr, "EP ROUTING [%s] dev=%d offset=%d n_local=%ld ids->ne=[%ld,%ld] n_ids=%ld: ",
+                        src0->name, ctx.device, expert_offset, (long)n_local_experts,
+                        (long)ids->ne[0], (long)ids->ne[1], (long)n_ids);
+                int local_count = 0;
+                for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
+                    for (int64_t id = 0; id < n_ids; id++) {
+                        int32_t eid = *(const int32_t *)(ids_host_ptr + iid1*ids->nb[1] + id*ids->nb[0]);
+                        fprintf(stderr, "%d ", eid);
+                        if (eid >= expert_offset && eid < expert_offset + n_local_experts) local_count++;
+                    }
+                    if (iid1 < ids->ne[1]-1) fprintf(stderr, "| ");
+                }
+                fprintf(stderr, " (local: %d)\n", local_count);
+            }
+        }
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
             for (int64_t id = 0; id < n_ids; id++) {
                 const int32_t i02 = *(const int32_t *) (ids_host_ptr + iid1*ids->nb[1] + id*ids->nb[0]);
 
                 if (ep_flag) {
                     // EP: skip non-local experts (dst already pre-zeroed)
-                    if (i02 < expert_offset || i02 >= expert_offset + n_local_experts) {
+                    static int ep_dispatch_count = 0;
+                    bool skip = (i02 < expert_offset || i02 >= expert_offset + n_local_experts);
+                    if (ep_dispatch_count < 40) {
+                        ep_dispatch_count++;
+                        fprintf(stderr, "EP_DISPATCH dev=%d expert_id=%d offset=%d n_local=%ld range=[%d,%ld) %s [%s]\n",
+                                ctx.device, i02, expert_offset, (long)n_local_experts,
+                                expert_offset, (long)(expert_offset + n_local_experts),
+                                skip ? "SKIPPED" : "PROCESSED", src0->name);
+                    }
+                    if (skip) {
                         continue;
                     }
                 } else {
@@ -6375,9 +6405,11 @@ static bool ggml_backend_sycl_allreduce_tensor(
 
     ggml_backend_sycl_context * ctx0 = (ggml_backend_sycl_context *)backends[0]->context;
 
-    // Need n_backends+1 host buffer slots: N for partials + 1 for reduction output
-    // Using a separate output slot avoids read-write hazard on slot 0
-    const size_t total_staging = nbytes * (n_backends + 1);
+    // Host-staged AllReduce: D2H all partials → CPU sum → H2D broadcast
+    // GPU-side reduction was removed: Intel Arc + Level Zero has USM coherency issues
+    // when a GPU kernel reads host memory written by D2H copies from other GPUs.
+    // Host-side reduction is reliable and fast enough (AVX-512 auto-vectorized).
+    const size_t total_staging = nbytes * n_backends;
     void * staging_base = ctx0->get_staging(total_staging);
     if (!staging_base) return false;
 
@@ -6385,41 +6417,49 @@ static bool ggml_backend_sycl_allreduce_tensor(
     for (size_t i = 0; i < n_backends; ++i) {
         host_bufs[i] = (float *)((char *)staging_base + i * nbytes);
     }
-    float * host_result = (float *)((char *)staging_base + n_backends * nbytes);
 
-    // Step 1: All GPUs → host staging (parallel, async, event-tracked)
-    sycl::event d2h_events[GGML_SYCL_MAX_DEVICES];
+    // Step 1: All GPUs → host (parallel — each on its own queue)
     for (size_t i = 0; i < n_backends; ++i) {
         ggml_backend_sycl_context * ctx = (ggml_backend_sycl_context *)backends[i]->context;
         const queue_ptr stream = ctx->stream(ctx->device, 0);
-        d2h_events[i] = stream->memcpy(host_bufs[i], tensors[i]->data, nbytes);
+        SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(host_bufs[i], tensors[i]->data, nbytes)));
     }
 
-    // Threshold: GPU-side reduction wins for small tensors where host sync overhead dominates.
-    // For large tensors, host-side is faster (CPU reads host memory at ~40 GB/s, GPU at ~12 GB/s over PCIe).
-    // 256KB ≈ 64K floats. Below this, the host wait() overhead (~50-100µs) dominates the actual sum time.
-    const bool use_gpu_reduction = (nbytes <= 256 * 1024);
+    // Wait for all GPU→host copies
+    for (size_t i = 0; i < n_backends; ++i) {
+        ggml_backend_sycl_context * ctx = (ggml_backend_sycl_context *)backends[i]->context;
+        SYCL_CHECK(CHECK_TRY_ERROR(ctx->stream(ctx->device, 0)->wait()));
+    }
 
-    // Helper lambda for host-side reduction fallback
-    auto do_host_reduction = [&]() {
-        for (size_t i = 0; i < n_backends; ++i) {
-            d2h_events[i].wait();
-        }
-        // AR VALUE DEBUG: print first few floats from each GPU before reduction (first 2 allreduces only)
-        if (ar_count <= 2) {
-            fprintf(stderr, "AR #%d [%s] ne=%ld n_backends=%zu\n",
-                    ar_count, tensors[0]->name, (long)ne, n_backends);
-            for (size_t i = 0; i < n_backends; ++i) {
-                fprintf(stderr, "  GPU%zu first 8 floats: ", i);
-                for (int k = 0; k < 8 && k < ne; ++k) fprintf(stderr, "%.4f ", host_bufs[i][k]);
-                int nz = 0;
-                for (int64_t k = 0; k < ne; ++k) if (host_bufs[i][k] != 0.0f) nz++;
-                fprintf(stderr, "... nonzeros=%d/%ld\n", nz, (long)ne);
+    // Step 2: Sum on host (in-place into host_bufs[0])
+    {
+        float * __restrict__ acc = host_bufs[0];
+
+        // DEBUG: dump AllReduce for first few calls
+        {
+            static int ar_debug_count = 0;
+            if (ar_debug_count < 12) {
+                ar_debug_count++;
+                fprintf(stderr, "AR #%d [%s] ne=%" PRId64 " nbytes=%zu:\n", ar_debug_count, tensors[0]->name, ne, nbytes);
+                for (size_t i = 0; i < n_backends; i++) {
+                    float * buf = host_bufs[i];
+                    float sum = 0, absmax = 0;
+                    int nz = 0;
+                    for (int64_t j = 0; j < ne; j++) {
+                        if (buf[j] != 0.0f) nz++;
+                        sum += buf[j];
+                        if (fabsf(buf[j]) > absmax) absmax = fabsf(buf[j]);
+                    }
+                    fprintf(stderr, "  GPU%zu: tensor=%p data=%p [%.4f,%.4f,%.4f,%.4f] nz=%d/%" PRId64 " sum=%.2f absmax=%.4f\n",
+                            i, (void*)tensors[i], tensors[i]->data,
+                            buf[0], buf[1], buf[2], buf[3],
+                            nz, ne, sum, absmax);
+                }
             }
         }
-        // Fused 3-way sum for common n_backends=3 case — single pass halves memory traffic
-        float * __restrict__ acc = host_bufs[0];
+
         if (n_backends == 3) {
+            // Fused 3-way sum: single pass halves memory traffic
             const float * __restrict__ src1 = host_bufs[1];
             const float * __restrict__ src2 = host_bufs[2];
             for (int64_t j = 0; j < ne; ++j) {
@@ -6433,70 +6473,21 @@ static bool ggml_backend_sycl_allreduce_tensor(
                 }
             }
         }
-        for (size_t i = 0; i < n_backends; ++i) {
-            ggml_backend_sycl_context * ctx = (ggml_backend_sycl_context *)backends[i]->context;
-            const queue_ptr stream = ctx->stream(ctx->device, 0);
-            SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(tensors[i]->data, acc, nbytes)));
-        }
-    };
 
-    if (use_gpu_reduction) {
-        // GPU-SIDE REDUCTION: zero host blocking
-        // GPU0 launches a kernel that reads all N partial buffers from host USM and writes sum to host_result.
-        // The kernel depends on ALL D2H copy events completing first.
-        const queue_ptr stream0 = ctx0->stream(ctx0->device, 0);
-
-        // Dependency events for the reduction kernel
-        std::vector<sycl::event> dep_events(d2h_events, d2h_events + n_backends);
-
-        // Launch reduction kernel on GPU0 — reads host_bufs[0..N-1], writes host_result
-        // GPU0's in-order queue already orders after its own D2H copy;
-        // we add explicit depends_on for other GPUs' D2H events.
-        sycl::event reduce_event;
-        if (n_backends == 3) {
-            // Specialized 3-way sum kernel (common case)
-            const float * src0 = host_bufs[0];
-            const float * src1 = host_bufs[1];
-            const float * src2 = host_bufs[2];
-            float * dst = host_result;
-            const int64_t count = ne;
-            reduce_event = stream0->submit([&](sycl::handler & cgh) {
-                cgh.depends_on(dep_events);
-                cgh.parallel_for(sycl::range<1>(count), [=](sycl::id<1> idx) {
-                    dst[idx] = src0[idx] + src1[idx] + src2[idx];
-                });
-            });
-        } else {
-            // Generic N-way: n_backends is always small (2-8), just unroll at runtime
-            // For n_backends != 3, fall back to host reduction (rare path, not worth complexity)
-            do_host_reduction();
-            goto done;
-        }
-
-        // Step 3: Host result → all GPUs (parallel, fire-and-forget)
-        // Each GPU's queue must wait for the reduce kernel before reading host_result.
-        // GPU0's in-order queue already orders after the kernel.
-        // GPU1/GPU2 need explicit event dependency.
-        for (size_t i = 0; i < n_backends; ++i) {
-            ggml_backend_sycl_context * ctx = (ggml_backend_sycl_context *)backends[i]->context;
-            const queue_ptr stream = ctx->stream(ctx->device, 0);
-            if (i == 0) {
-                // GPU0: in-order queue, reduce_event already on this queue — just memcpy
-                SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(tensors[i]->data, host_result, nbytes)));
-            } else {
-                // GPU1/GPU2: must wait for GPU0's reduce kernel to finish
-                stream->submit([&](sycl::handler & cgh) {
-                    cgh.depends_on(reduce_event);
-                    cgh.memcpy(tensors[i]->data, host_result, nbytes);
-                });
-            }
-        }
-    } else {
-        // HOST-SIDE REDUCTION: optimal for large tensors (>256KB)
-        // Block host to wait for D2H copies, sum on CPU (AVX-512 auto-vectorized), fire-and-forget H2D.
-        do_host_reduction();
     }
-    done:
+
+    // Step 3: Host → all GPUs (parallel)
+    for (size_t i = 0; i < n_backends; ++i) {
+        ggml_backend_sycl_context * ctx = (ggml_backend_sycl_context *)backends[i]->context;
+        const queue_ptr stream = ctx->stream(ctx->device, 0);
+        SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(tensors[i]->data, host_bufs[0], nbytes)));
+    }
+
+    // Wait for all host→GPU copies
+    for (size_t i = 0; i < n_backends; ++i) {
+        ggml_backend_sycl_context * ctx = (ggml_backend_sycl_context *)backends[i]->context;
+        SYCL_CHECK(CHECK_TRY_ERROR(ctx->stream(ctx->device, 0)->wait()));
+    }
 
     if (do_timing) {
         auto t1 = std::chrono::high_resolution_clock::now();
