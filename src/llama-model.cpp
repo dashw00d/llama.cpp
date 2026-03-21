@@ -3866,6 +3866,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
 
                         layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, 0);
+                        // Gate bias: used by expert-padding script to suppress fake experts
+                        // with bias=-1e30, making them unreachable regardless of hidden state sign
+                        layer.ffn_gate_inp_b = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED);
 
                         if (n_expert == 0) {
                             throw std::runtime_error("n_expert must be > 0 for QWEN3MOE");

@@ -91,9 +91,13 @@ llm_build_qwen3moe::llm_build_qwen3moe(const llama_model & model, const llm_grap
         ggml_tensor * moe_out =
             build_moe_ffn(cur,
                     model.layers[il].ffn_gate_inp,
+                    model.layers[il].ffn_gate_inp_b,  // gate bias: suppresses padded fake experts
                     model.layers[il].ffn_up_exps,
+                    nullptr,
                     model.layers[il].ffn_gate_exps,
+                    nullptr,
                     model.layers[il].ffn_down_exps,
+                    nullptr,
                     nullptr,
                     n_expert, n_expert_used,
                     LLM_FFN_SILU, true,
