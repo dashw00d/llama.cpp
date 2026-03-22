@@ -37,6 +37,8 @@ const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis
             return "MIRRORED";
         case GGML_BACKEND_SPLIT_AXIS_PARTIAL:
             return "PARTIAL";
+        case GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE:
+            return "EXCLUSIVE";
         case GGML_BACKEND_SPLIT_AXIS_NONE:
             return "NONE";
         case GGML_BACKEND_SPLIT_AXIS_UNKNOWN:
@@ -455,6 +457,11 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor(ggml_backend_buffer
                     nb[i] = tensor->nb[i] * ne[split_dim]/tensor->ne[split_dim];
                 }
             }
+        } else if (split_dim == GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE) {
+            // EXCLUSIVE: all GPUs get full-size allocation (needed for broadcast).
+            // The subgraph skip logic avoids computing on non-owning GPUs.
+            // This wastes memory but avoids zero-size tensor creation issues.
+            // ne[] stays unchanged — same as MIRRORED for allocation purposes.
         }
 
         ggml_tensor * t_ij = ggml_new_tensor(simple_ctx, tensor->type, GGML_MAX_DIMS, ne);
@@ -570,6 +577,16 @@ static void ggml_backend_meta_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
                 ggml_backend_tensor_set(simple_tensor, tmp.data(), offset, size);
             }
         } break;
+        case GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE: {
+            // EXCLUSIVE: set on the owning GPU only (the one with ne[j] > 0)
+            for (size_t j = 0; j < n_bufs; j++) {
+                if (split_state.ne[j] > 0) {
+                    ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                    ggml_backend_tensor_set(simple_tensor, data, offset, size);
+                    break;
+                }
+            }
+        } break;
         default: {
             GGML_ABORT("fatal error");
         } break;
@@ -606,6 +623,16 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
             // TODO other simple backend may be better
             const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, 0);
             ggml_backend_tensor_get(simple_tensor, data, offset, size);
+        } break;
+        case GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE: {
+            // EXCLUSIVE: get from the owning GPU (the one with ne[j] > 0)
+            for (size_t j = 0; j < n_bufs; j++) {
+                if (split_state.ne[j] > 0) {
+                    const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                    ggml_backend_tensor_get(simple_tensor, data, offset, size);
+                    break;
+                }
+            }
         } break;
         default: {
             GGML_ABORT("fatal error");
@@ -827,6 +854,15 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
                     ggml_backend_meta_simple_backend(backend, j), ggml_backend_meta_buffer_simple_tensor(tensor, j), data, offset, size);
             }
         } break;
+        case GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE: {
+            for (size_t j = 0; j < n_backends; j++) {
+                if (split_state.ne[j] > 0) {
+                    ggml_backend_tensor_set_async(
+                        ggml_backend_meta_simple_backend(backend, j), ggml_backend_meta_buffer_simple_tensor(tensor, j), data, offset, size);
+                    break;
+                }
+            }
+        } break;
         default: {
             GGML_ABORT("fatal error");
         } break;
@@ -866,6 +902,16 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
             ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, 0);
             const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, 0);
             ggml_backend_tensor_get_async(simple_backend, simple_tensor, data, offset, size);
+        } break;
+        case GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE: {
+            for (size_t j = 0; j < n_backends; j++) {
+                if (split_state.ne[j] > 0) {
+                    ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, j);
+                    const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, j);
+                    ggml_backend_tensor_get_async(simple_backend, simple_tensor, data, offset, size);
+                    break;
+                }
+            }
         } break;
         default: {
             GGML_ABORT("fatal error");
@@ -1390,6 +1436,11 @@ struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const str
         if (a.axis != b.axis) {
             return false;
         }
+        // EXCLUSIVE: all EXCLUSIVE states are equal regardless of ne[] (which encodes owner GPU).
+        // Two EXCLUSIVE tensors in the same op are on the same GPU (same layer context).
+        if (a.axis == GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE) {
+            return true;
+        }
         for (size_t j = 0; j < n_bufs; j++) {
             if (a.ne[j] != b.ne[j]) {
                 return false;
@@ -1407,6 +1458,30 @@ struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const str
             if (homogeneous_src_split_state.axis == GGML_BACKEND_SPLIT_AXIS_NONE) {
                 homogeneous_src_split_state = src_split_states[i];
             } else if (!split_states_equal(src_split_states[i], homogeneous_src_split_state)) {
+                const auto ax_cur = homogeneous_src_split_state.axis;
+                const auto ax_new = src_split_states[i].axis;
+                // EXCLUSIVE + EXCLUSIVE → keep EXCLUSIVE (same layer, same GPU)
+                if (ax_cur == GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE && ax_new == GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE) {
+                    continue;
+                }
+                // EXCLUSIVE + MIRRORED → keep EXCLUSIVE (most restrictive — data on one GPU)
+                if ((ax_cur == GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE && ax_new == GGML_BACKEND_SPLIT_AXIS_MIRRORED) ||
+                    (ax_cur == GGML_BACKEND_SPLIT_AXIS_MIRRORED && ax_new == GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE)) {
+                    if (ax_new == GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE) {
+                        homogeneous_src_split_state = src_split_states[i];
+                    }
+                    continue;
+                }
+                // EXCLUSIVE + PARTIAL → keep EXCLUSIVE (after AllReduce, result is on all GPUs)
+                if ((ax_cur == GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE && ax_new == GGML_BACKEND_SPLIT_AXIS_PARTIAL) ||
+                    (ax_cur == GGML_BACKEND_SPLIT_AXIS_PARTIAL && ax_new == GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE)) {
+                    if (ax_cur != GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE) {
+                        homogeneous_src_split_state = src_split_states[i];
+                    }
+                    continue;
+                }
+                fprintf(stderr, "[META-GENERIC-FAIL] op=%s tensor=%s ax_cur=%d ax_new=%d\n",
+                        ggml_op_name(tensor->op), tensor->name, (int)ax_cur, (int)ax_new);
                 homogeneous_src_split_state = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}};
                 break;
             }
@@ -1414,6 +1489,7 @@ struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const str
         if (homogeneous_src_split_state.axis == GGML_BACKEND_SPLIT_AXIS_NONE) {
             homogeneous_src_split_state = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}};
         }
+        // scalar_only: reject dimensional splits but allow EXCLUSIVE (not a split)
         if (scalar_only && homogeneous_src_split_state.axis >= 0 && homogeneous_src_split_state.axis < GGML_MAX_DIMS) {
             homogeneous_src_split_state = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}};
         }
@@ -1454,21 +1530,31 @@ struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const str
     };
 
     auto handle_mul_mat = [&](const std::vector<ggml_backend_meta_split_state> & src_split_states) -> ggml_backend_meta_split_state {
-        if (src_split_states[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_split_states[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+        const auto a0 = src_split_states[0].axis;
+        const auto a1 = src_split_states[1].axis;
+        if (a0 == GGML_BACKEND_SPLIT_AXIS_MIRRORED && a1 == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}};
         }
-        if (src_split_states[0].axis == GGML_BACKEND_SPLIT_AXIS_1 && src_split_states[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+        // EXCLUSIVE activation + MIRRORED weights → EXCLUSIVE (compute on owning GPU)
+        if (a0 == GGML_BACKEND_SPLIT_AXIS_MIRRORED && a1 == GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE) {
+            return {GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE, {0}};
+        }
+        // EXCLUSIVE weights + EXCLUSIVE activation → EXCLUSIVE
+        if (a0 == GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE && a1 == GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE) {
+            return {GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE, {0}};
+        }
+        if (a0 == GGML_BACKEND_SPLIT_AXIS_1 && a1 == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             ggml_backend_meta_split_state ret = src_split_states[0];
             ret.axis = GGML_BACKEND_SPLIT_AXIS_0;
             return ret;
         }
-        if (src_split_states[0].axis == GGML_BACKEND_SPLIT_AXIS_0 && src_split_states[1].axis == GGML_BACKEND_SPLIT_AXIS_0) {
+        if (a0 == GGML_BACKEND_SPLIT_AXIS_0 && a1 == GGML_BACKEND_SPLIT_AXIS_0) {
             for (size_t j = 0; j < n_bufs; j++) {
                 GGML_ASSERT(src_split_states[0].ne[j] == src_split_states[1].ne[j]);
             }
             return {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL, {0}};
         }
-        GGML_ABORT("fatal error");
+        GGML_ABORT("handle_mul_mat: unsupported split combination a0=%d a1=%d", (int)a0, (int)a1);
         return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}};
     };
 
@@ -1481,8 +1567,10 @@ struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const str
             //                     PARTIAL for down (after GLU combines gate+up outputs)
             // src2 (routing ids) should be MIRRORED
             GGML_ASSERT(src_split_states[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
-                        src_split_states[1].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL);
-            GGML_ASSERT(src_split_states[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                        src_split_states[1].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL ||
+                        src_split_states[1].axis == GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE);
+            GGML_ASSERT(src_split_states[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
+                        src_split_states[2].axis == GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE);
             // Output is PARTIAL: each GPU computes full results for owned experts, zeros for others.
             // AllReduce SUM will combine them correctly (zeros + real values = real values).
             // Output is PARTIAL during compute (each GPU has partial results).
@@ -1522,7 +1610,8 @@ struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const str
                 GGML_ABORT("shape mismatch for %s", ggml_op_name(tensor->op));
             }
             case GGML_BACKEND_SPLIT_AXIS_MIRRORED:
-            case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
+            case GGML_BACKEND_SPLIT_AXIS_PARTIAL:
+            case GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE: {
                 return src_split_states[0];
             }
             default: {
@@ -1567,7 +1656,8 @@ struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const str
                 return {ggml_backend_meta_split_axis(tensor->op_params[src_split_states[0].axis]), {0}};
             }
             case GGML_BACKEND_SPLIT_AXIS_MIRRORED:
-            case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
+            case GGML_BACKEND_SPLIT_AXIS_PARTIAL:
+            case GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE: {
                 return src_split_states[0];
             }
             default: {
@@ -1579,8 +1669,21 @@ struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const str
 
     auto handle_set_rows = [&](const std::vector<ggml_backend_meta_split_state> & src_split_states) -> ggml_backend_meta_split_state {
         GGML_ASSERT(src_split_states[0].axis != GGML_BACKEND_SPLIT_AXIS_1);
-        GGML_ASSERT(src_split_states[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
-        GGML_ASSERT(split_states_equal(src_split_states[0], src_split_states[2]));
+        GGML_ASSERT(src_split_states[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
+                    src_split_states[1].axis == GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE);
+        // EXCLUSIVE src + MIRRORED dst is valid (compute writes to cache on owning GPU)
+        if (!split_states_equal(src_split_states[0], src_split_states[2])) {
+            GGML_ASSERT(
+                (src_split_states[0].axis == GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE &&
+                 src_split_states[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) ||
+                (src_split_states[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+                 src_split_states[2].axis == GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE));
+        }
+        // Return the more restrictive state
+        if (src_split_states[0].axis == GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE ||
+            src_split_states[2].axis == GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE) {
+            return {GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE, {0}};
+        }
         return src_split_states[0];
     };
 

@@ -113,8 +113,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 std::regex_match(tensor_name, pattern_ffn_down_exps_bias)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
             }
-            // Non-expert tensors → MIRRORED
-            // TODO: layer-split for non-MoE compute requires broadcast at MoE boundaries
+            // Non-expert per-layer tensors → EXCLUSIVE (entire tensor on one GPU,
+            // layer rotation determines which GPU). At MoE boundaries, broadcast
+            // copies the activation from owning GPU to all GPUs for EP compute.
+            if (tensor_name.substr(0, 4) == "blk.") {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE);
+            }
+            // Global tensors (embeddings, output) → MIRRORED
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
 
@@ -264,6 +269,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             low = high;
         }
         split_state.ne[(j + effective_rotation) % ud->n_devices] = ne_full - low;
+    } else if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE) {
+        // EXCLUSIVE: entire tensor on one GPU. Use rotation to determine owner.
+        // ne[owner] = ne[0] (full first dimension), ne[others] = 0.
+        memset(split_state.ne, 0, sizeof(split_state.ne));
+        const size_t owner = tc.rotation % ud->n_devices;
+        split_state.ne[owner] = tensor->ne[0];
     } else {
         memset(split_state.ne, 0, sizeof(split_state.ne));
     }

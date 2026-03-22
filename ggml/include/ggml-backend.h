@@ -232,8 +232,9 @@ extern "C" {
         GGML_BACKEND_SPLIT_AXIS_2   =  2,
         GGML_BACKEND_SPLIT_AXIS_3   =  3,
 
-        GGML_BACKEND_SPLIT_AXIS_MIRRORED = 10, // all values on all backends
-        GGML_BACKEND_SPLIT_AXIS_PARTIAL  = 11, // each backend has a partial sum
+        GGML_BACKEND_SPLIT_AXIS_MIRRORED  = 10, // all values on all backends
+        GGML_BACKEND_SPLIT_AXIS_PARTIAL   = 11, // each backend has a partial sum
+        GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE = 12, // entire tensor on one backend only (hybrid EP)
 
         // for internal bookkeeping only:
         GGML_BACKEND_SPLIT_AXIS_NONE     = 98,
