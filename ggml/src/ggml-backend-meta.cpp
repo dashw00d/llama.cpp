@@ -1137,11 +1137,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             // into MUL_MAT_ID with SPLIT_AXIS_2 (expert weights). This creates one
             // boundary per layer between DeltaNet/attention and MoE, not hundreds.
             bool exclusive_to_ep_transition = false;
-            // Split before MoE gate: when the current node is the MoE gate logits
-            // (name contains "ffn_moe_logits"), this is the transition from
-            // DeltaNet/attention (EXCLUSIVE) to MoE routing (needs all GPUs).
-            if (node->name && strstr(node->name, "ffn_moe_logits") != nullptr &&
-                strstr(node->name, "biased") == nullptr) {
+            // Split at post-attention norm: the last EXCLUSIVE tensor before MoE.
+            // Gate MUL_MAT moves into EP subgraph (cheap, runs on all GPUs).
+            // Only attn_post_norm needs broadcast (16KB per token).
+            if (node->name && strstr(node->name, "attn_post_norm") != nullptr &&
+                strstr(node->name, "reshaped") == nullptr) {
                 exclusive_to_ep_transition = true;
             }
 
@@ -1361,11 +1361,31 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     ggml_backend_meta_split_state last_state = ggml_backend_meta_get_split_state(orig_last, true);
                     if (last_state.axis == GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE) {
                         subgraph_exclusive = true;
-                        for (size_t j = 0; j < n_backends; j++) {
-                            if (last_state.ne[j] > 0) {
-                                exclusive_owner = j;
-                                break;
+                        // Find owner by looking at WEIGHT tensors (they have ne[owner]>0, ne[others]=0).
+                        // Compute tensors have ne[j]>0 for all GPUs (full allocation).
+                        bool found_owner = false;
+                        for (size_t ni = i_node_start; ni < i_node_stop && !found_owner; ni++) {
+                            ggml_tensor * n = cgraph->nodes[ni];
+                            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                                if (n->src[s] == nullptr) break;
+                                ggml_tensor * src = n->src[s];
+                                if (src->buffer && ggml_backend_buffer_is_meta(src->buffer) &&
+                                    ggml_backend_buffer_get_usage(src->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+                                    ggml_backend_meta_split_state ws = ggml_backend_meta_get_split_state(src, true);
+                                    if (ws.axis == GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE) {
+                                        // Check which GPU has non-zero ne (the owner)
+                                        int zero_count = 0;
+                                        for (size_t j = 0; j < n_backends; j++) {
+                                            if (ws.ne[j] == 0) zero_count++;
+                                            else exclusive_owner = j;
+                                        }
+                                        if (zero_count > 0) { found_owner = true; break; }
+                                    }
+                                }
                             }
+                        }
+                        if (!found_owner) {
+                            exclusive_owner = 0; // fallback
                         }
                     }
                 }
@@ -1384,27 +1404,78 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
-        // EXCLUSIVE→EP broadcast: after an EXCLUSIVE subgraph, broadcast the
-        // output tensor to all GPUs so the next EP subgraph has the activation.
-        if (subgraph_exclusive && n_backends > 1 && i < n_subgraphs - 1) {
-            // Broadcast the last node's output from owning GPU to all others
-            ggml_tensor * bcast_node = backend_ctx->backend_configs[exclusive_owner].cgraphs[i].cgraph_main->nodes[
-                backend_ctx->backend_configs[exclusive_owner].cgraphs[i].cgraph_main->n_nodes - 1];
-            const size_t nbytes = ggml_nbytes(bcast_node);
-            if (nbytes > 0 && nbytes < 64*1024*1024) { // sanity: < 64MB
+        // EXCLUSIVE→EP broadcast: after an EXCLUSIVE subgraph, broadcast ALL
+        // tensors that cross into the next EP subgraph. Finds cross-boundary
+        // tensors by checking EP subgraph nodes' src[] for EXCLUSIVE tensors.
+        if (subgraph_exclusive && n_backends > 1 && i + 1 < n_subgraphs) {
+            // Collect unique EXCLUSIVE tensors consumed by the next subgraph
+            auto & bc_owner = backend_ctx->backend_configs[exclusive_owner];
+            size_t next_start = bc_owner.cgraphs[i + 1].offset;
+            size_t next_stop = (i + 2 < n_subgraphs) ? bc_owner.cgraphs[i + 2].offset : cgraph->n_nodes;
+
+            std::vector<size_t> bcast_node_indices; // indices into the EXCLUSIVE subgraph
+            size_t excl_start = bc_owner.cgraphs[i].offset;
+            size_t excl_stop = next_start;
+
+            for (size_t ni = next_start; ni < next_stop; ni++) {
+                ggml_tensor * ep_node = cgraph->nodes[ni];
+                for (int s = 0; s < GGML_MAX_SRC; s++) {
+                    if (ep_node->src[s] == nullptr) break;
+                    // Check if this src was produced in the EXCLUSIVE subgraph
+                    for (size_t ei = excl_start; ei < excl_stop; ei++) {
+                        if (cgraph->nodes[ei] == ep_node->src[s]) {
+                            // Found a cross-boundary tensor — check if already tagged
+                            bool already = false;
+                            for (size_t idx : bcast_node_indices) {
+                                if (idx == ei) { already = true; break; }
+                            }
+                            if (!already) {
+                                bcast_node_indices.push_back(ei);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Also check the ENTIRE remaining graph for residual connections
+            // that reference tensors from this EXCLUSIVE subgraph
+            for (size_t ni = next_stop; ni < (size_t)cgraph->n_nodes && ni < next_stop + 100; ni++) {
+                ggml_tensor * node_after = cgraph->nodes[ni];
+                for (int s = 0; s < GGML_MAX_SRC; s++) {
+                    if (node_after->src[s] == nullptr) break;
+                    for (size_t ei = excl_start; ei < excl_stop; ei++) {
+                        if (cgraph->nodes[ei] == node_after->src[s]) {
+                            bool already = false;
+                            for (size_t idx : bcast_node_indices) {
+                                if (idx == ei) { already = true; break; }
+                            }
+                            if (!already) {
+                                bcast_node_indices.push_back(ei);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Broadcast each cross-boundary tensor
+            static int bcast_log_count = 0;
+            for (size_t idx : bcast_node_indices) {
+                ggml_tensor * owner_tensor = bc_owner.nodes[idx];
+                const size_t nbytes = ggml_nbytes(owner_tensor);
+                if (nbytes == 0 || nbytes > 64*1024*1024) continue;
+
                 std::vector<char> host_buf(nbytes);
-                ggml_backend_tensor_get(bcast_node, host_buf.data(), 0, nbytes);
+                ggml_backend_tensor_get(owner_tensor, host_buf.data(), 0, nbytes);
                 for (size_t j = 0; j < n_backends; j++) {
                     if (j == exclusive_owner) continue;
-                    ggml_tensor * dst = backend_ctx->backend_configs[j].cgraphs[i].cgraph_main->nodes[
-                        backend_ctx->backend_configs[j].cgraphs[i].cgraph_main->n_nodes - 1];
-                    ggml_backend_tensor_set(dst, host_buf.data(), 0, nbytes);
+                    ggml_tensor * dst_tensor = backend_ctx->backend_configs[j].nodes[idx];
+                    ggml_backend_tensor_set(dst_tensor, host_buf.data(), 0, nbytes);
                 }
-                static int bcast_count = 0;
-                if (bcast_count < 5) {
-                    bcast_count++;
-                    fprintf(stderr, "[META-BROADCAST] subgraph %zu: %zu bytes from GPU%zu to %zu GPUs (tensor=%s)\n",
-                            i, nbytes, exclusive_owner, n_backends - 1, bcast_node->name);
+
+                if (bcast_log_count < 100) {
+                    bcast_log_count++;
+                    fprintf(stderr, "[META-BROADCAST] subgraph %zu: %zu bytes from GPU%zu (tensor=%s, idx=%zu)\n",
+                            i, nbytes, exclusive_owner, owner_tensor->name, idx);
                 }
             }
         }

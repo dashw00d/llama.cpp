@@ -113,10 +113,20 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 std::regex_match(tensor_name, pattern_ffn_down_exps_bias)) {
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
             }
-            // Non-expert per-layer tensors → EXCLUSIVE (entire tensor on one GPU,
-            // layer rotation determines which GPU). At MoE boundaries, broadcast
-            // copies the activation from owning GPU to all GPUs for EP compute.
+            // Per-layer non-expert tensors: split between EXCLUSIVE and MIRRORED.
+            // DeltaNet/attention weights → EXCLUSIVE (only needed on owning GPU)
+            // MoE routing weights (gate, norms) → MIRRORED (needed on all GPUs for EP)
             if (tensor_name.substr(0, 4) == "blk.") {
+                // MoE-related weights that EP needs on all GPUs → MIRRORED
+                if (tensor_name.find("ffn_gate_inp") != std::string::npos ||
+                    tensor_name.find("ffn_gate_shexp") != std::string::npos ||
+                    tensor_name.find("ffn_up_shexp") != std::string::npos ||
+                    tensor_name.find("ffn_down_shexp") != std::string::npos ||
+                    tensor_name.find("attn_post_norm") != std::string::npos ||
+                    tensor_name.find("attn_norm") != std::string::npos) {
+                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+                }
+                // Everything else (attention Q/K/V/O, DeltaNet SSM, convolutions) → EXCLUSIVE
                 return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE);
             }
             // Global tensors (embeddings, output) → MIRRORED
