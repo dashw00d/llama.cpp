@@ -4774,6 +4774,81 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
         }
 #endif
+        // topk-moe fusion: fuse SOFT_MAX → RESHAPE → ARGSORT → VIEW → GET_ROWS
+        // into a single kernel call, replacing 5+ ops with 1.
+        // Handles: optional ADD (gate bias) before SOFT_MAX,
+        //          optional norm chain (RESHAPE → SUM_ROWS → CLAMP → DIV → RESHAPE),
+        //          optional SCALE at the end.
+        if ((node->op == GGML_OP_SOFT_MAX || (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_SIGMOID))
+            && i + 4 < cgraph->n_nodes) {
+
+            // Extract logits and optional bias from SOFT_MAX input.
+            // Pattern A: MUL_MAT → ADD(logits, bias) → SOFT_MAX (has gate bias)
+            // Pattern B: MUL_MAT → SOFT_MAX (no bias)
+            const ggml_tensor * logits_raw = node->src[0];
+            const ggml_tensor * bias_t = nullptr;
+
+            if (logits_raw->op == GGML_OP_ADD && logits_raw->src[1] != nullptr) {
+                // ADD node: src[0] = raw logits from MUL_MAT, src[1] = gate bias
+                bias_t     = logits_raw->src[1];
+                logits_raw = logits_raw->src[0]; // the actual logits before bias
+            }
+
+            // Pattern: SOFT_MAX/SIGMOID → RESHAPE → ARGSORT → VIEW → GET_ROWS
+            ggml_tensor * n1 = cgraph->nodes[i + 1]; // RESHAPE
+            ggml_tensor * n2 = cgraph->nodes[i + 2]; // ARGSORT
+            ggml_tensor * n3 = cgraph->nodes[i + 3]; // VIEW
+            ggml_tensor * n4 = cgraph->nodes[i + 4]; // GET_ROWS
+
+            // ARGSORT takes selection_probs directly (== SOFT_MAX output, not RESHAPE)
+            // GET_ROWS takes reshaped probs (== RESHAPE output) and VIEW of argsort
+            if (n1->op == GGML_OP_RESHAPE && n1->src[0] == node &&
+                n2->op == GGML_OP_ARGSORT  && (n2->src[0] == node || n2->src[0] == n1) &&
+                n3->op == GGML_OP_VIEW     && n3->src[0] == n2 &&
+                n4->op == GGML_OP_GET_ROWS && n4->src[0] == n1 && n4->src[1] == n3) {
+
+                ggml_tensor *       ids     = n2; // argsort output → expert IDs
+                ggml_tensor *       weights = n4; // get_rows output → expert weights
+
+                if (ggml_sycl_should_use_topk_moe(node, weights, logits_raw, ids)) {
+
+                    // Look for optional norm chain after GET_ROWS
+                    const ggml_tensor * clamp_t = nullptr;
+                    const ggml_tensor * scale_t = nullptr;
+                    int skip = 5;
+
+                    int j = i + 5;
+                    if (j + 4 < cgraph->n_nodes &&
+                        cgraph->nodes[j]->op == GGML_OP_RESHAPE &&
+                        cgraph->nodes[j + 1]->op == GGML_OP_SUM_ROWS &&
+                        cgraph->nodes[j + 2]->op == GGML_OP_CLAMP &&
+                        cgraph->nodes[j + 3]->op == GGML_OP_DIV &&
+                        cgraph->nodes[j + 4]->op == GGML_OP_RESHAPE) {
+                        clamp_t = cgraph->nodes[j + 2];
+                        weights = cgraph->nodes[j + 4];
+                        skip += 5;
+                        j += 5;
+                    }
+
+                    if (j < cgraph->n_nodes && cgraph->nodes[j]->op == GGML_OP_SCALE &&
+                        cgraph->nodes[j]->src[0] == cgraph->nodes[j - 1]) {
+                        scale_t = cgraph->nodes[j];
+                        weights = cgraph->nodes[j];
+                        skip += 1;
+                    }
+
+                    ggml_sycl_topk_moe_args args;
+                    args.sigmoid         = (node->op == GGML_OP_UNARY);
+                    args.delayed_softmax = false;
+
+                    ggml_sycl_op_topk_moe(*sycl_ctx, logits_raw, weights, ids,
+                                           clamp_t, scale_t, bias_t, args);
+                    i += skip - 1;
+                    continue;
+                }
+            }
+        }
+
         bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
         if (!ok) {
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
