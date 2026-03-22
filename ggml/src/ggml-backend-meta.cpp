@@ -1133,8 +1133,23 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             if (!defer_ep_allreduce && split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
                 max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node));
             }
+            // Split subgraph at EXCLUSIVE→MIRRORED/PARTIAL transitions.
+            // This creates a boundary between DeltaNet/attention (EXCLUSIVE, one GPU)
+            // and MoE routing (MIRRORED/PARTIAL, all GPUs), enabling broadcast between them.
+            bool exclusive_to_ep_transition = false;
+            if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE && i + 1 < cgraph->n_nodes) {
+                ggml_tensor * next = cgraph->nodes[i + 1];
+                if (next->view_src == nullptr || !ggml_backend_buffer_is_host(next->view_src->buffer)) {
+                    ggml_backend_meta_split_state next_state = ggml_backend_meta_get_split_state(next, false);
+                    if (next_state.axis != GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE) {
+                        exclusive_to_ep_transition = true;
+                    }
+                }
+            }
+
             const bool new_subgraph = i + 1 == cgraph->n_nodes ||
-                (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL && !defer_ep_allreduce);
+                (split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL && !defer_ep_allreduce) ||
+                exclusive_to_ep_transition;
             if (!new_subgraph) {
                 continue;
             }
@@ -1396,7 +1411,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             }
         }
 
-        if (n_backends > 1 && i < n_subgraphs - 1) {
+        // AllReduce only for PARTIAL subgraphs (EP). EXCLUSIVE subgraphs use broadcast instead.
+        if (n_backends > 1 && i < n_subgraphs - 1 && !subgraph_exclusive) {
             bool backend_allreduce_success = false;
             ggml_backend_allreduce_tensor_t allreduce_tensor = (ggml_backend_allreduce_tensor_t) ggml_backend_reg_get_proc_address(
                 ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_ctx->backend_configs[0].backend)), "ggml_backend_allreduce_tensor");
