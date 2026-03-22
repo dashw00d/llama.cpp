@@ -1474,33 +1474,35 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     ggml_build_forward_expand(gf, experts);
 
-    ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
+    // Aggregate experts: sum weighted expert outputs along the expert dimension.
+    // experts shape: [n_embd, n_expert_used, n_tokens]
+    // target shape:  [n_embd, n_tokens]
+    //
+    // Previously: 7 sequential ggml_add ops (one per expert pair).
+    // Now: permute expert dim to dim0, make contiguous, sum_rows.
+    // Reduces 7+ graph nodes to 3 for n_expert_used=8.
+    ggml_tensor * moe_out;
 
     assert(n_expert_used > 0);
 
-    // order the views before the adds
-    for (uint32_t i = 0; i < hparams.n_expert_used; ++i) {
-        cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
-
-        ggml_build_forward_expand(gf, cur_experts[i]);
-    }
-
-    // aggregate experts
-    // note: here we explicitly use hparams.n_expert_used instead of n_expert_used
-    //       to avoid potentially a large number of add nodes during warmup
-    //       ref: https://github.com/ggml-org/llama.cpp/pull/14753
-    ggml_tensor * moe_out = cur_experts[0];
-
-    for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
-        moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
-
-        ggml_build_forward_expand(gf, moe_out);
-    }
-
     if (hparams.n_expert_used == 1) {
-        // avoid returning a non-contiguous tensor
+        moe_out = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], 0);
         moe_out = ggml_cont(ctx0, moe_out);
+    } else {
+        // [n_embd, n_expert_used, n_tokens] → [n_expert_used, n_embd, n_tokens]
+        ggml_tensor * perm = ggml_permute(ctx0, experts, 1, 0, 2, 3);
+
+        // Make contiguous so sum_rows can use simple row-major indexing
+        perm = ggml_cont(ctx0, perm);
+
+        // Sum along dim0 (expert dim): [n_expert_used, n_embd, n_tokens] → [1, n_embd, n_tokens]
+        moe_out = ggml_sum_rows(ctx0, perm);
+
+        // Reshape to [n_embd, n_tokens]
+        moe_out = ggml_reshape_2d(ctx0, moe_out, n_embd, n_tokens);
     }
+
+    ggml_build_forward_expand(gf, moe_out);
 
     cb(moe_out, "ffn_moe_out", il);
 
