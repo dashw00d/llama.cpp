@@ -4027,9 +4027,12 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     const int64_t n_local_experts = ne02;
     const bool    ep_flag         = (dst->op_params[2] > 0);
 
-    // Pre-zero output for EP: non-owned expert slots must be zero for AllReduce SUM
+    // Pre-zero output for EP: non-owned expert slots must be zero for AllReduce SUM.
+    // Explicit wait required — L0 in-order queue does NOT guarantee memset completes
+    // before subsequent kernel launches (known L0 bug on Arc A770).
     if (ep_flag) {
         SYCL_CHECK(CHECK_TRY_ERROR(stream->memset(dst->data, 0, ggml_nbytes(dst))));
+        stream->wait();
     }
 
     const size_t ids_nbytes = ggml_nbytes(ids);
