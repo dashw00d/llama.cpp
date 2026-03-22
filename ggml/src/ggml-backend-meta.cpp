@@ -1332,11 +1332,67 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     auto t_total_start = std::chrono::high_resolution_clock::now();
 
     for (size_t i = 0; i < n_subgraphs; i++) {
+        // Determine if this subgraph is EXCLUSIVE (non-MoE, one GPU only)
+        // by checking the split state of the last ORIGINAL node (not per-GPU copy).
+        bool subgraph_exclusive = false;
+        size_t exclusive_owner = 0;
+
+        if (n_backends > 1) {
+            // Get the original graph node index for this subgraph's last node
+            auto & bc0 = backend_ctx->backend_configs[0];
+            size_t i_node_start = bc0.cgraphs[i].offset;
+            size_t i_node_stop = (i + 1 < n_subgraphs) ? bc0.cgraphs[i + 1].offset : cgraph->n_nodes;
+            if (i_node_stop > i_node_start) {
+                ggml_tensor * orig_last = cgraph->nodes[i_node_stop - 1];
+                if (orig_last->buffer && ggml_backend_buffer_is_meta(orig_last->buffer)) {
+                    ggml_backend_meta_split_state last_state = ggml_backend_meta_get_split_state(orig_last, true);
+                    if (last_state.axis == GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE) {
+                        subgraph_exclusive = true;
+                        for (size_t j = 0; j < n_backends; j++) {
+                            if (last_state.ne[j] > 0) {
+                                exclusive_owner = j;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         for (size_t j = 0; j < n_backends; j++) {
+            // EXCLUSIVE subgraph: only owning GPU computes
+            if (subgraph_exclusive && j != exclusive_owner) {
+                continue;
+            }
             auto & bcj = backend_ctx->backend_configs[j];
             const ggml_status status = ggml_backend_graph_compute_async(bcj.backend, bcj.cgraphs[i].cgraph_main);
             if (status != GGML_STATUS_SUCCESS) {
                 return status;
+            }
+        }
+
+        // EXCLUSIVE→EP broadcast: after an EXCLUSIVE subgraph, broadcast the
+        // output tensor to all GPUs so the next EP subgraph has the activation.
+        if (subgraph_exclusive && n_backends > 1 && i < n_subgraphs - 1) {
+            // Broadcast the last node's output from owning GPU to all others
+            ggml_tensor * bcast_node = backend_ctx->backend_configs[exclusive_owner].cgraphs[i].cgraph_main->nodes[
+                backend_ctx->backend_configs[exclusive_owner].cgraphs[i].cgraph_main->n_nodes - 1];
+            const size_t nbytes = ggml_nbytes(bcast_node);
+            if (nbytes > 0 && nbytes < 64*1024*1024) { // sanity: < 64MB
+                std::vector<char> host_buf(nbytes);
+                ggml_backend_tensor_get(bcast_node, host_buf.data(), 0, nbytes);
+                for (size_t j = 0; j < n_backends; j++) {
+                    if (j == exclusive_owner) continue;
+                    ggml_tensor * dst = backend_ctx->backend_configs[j].cgraphs[i].cgraph_main->nodes[
+                        backend_ctx->backend_configs[j].cgraphs[i].cgraph_main->n_nodes - 1];
+                    ggml_backend_tensor_set(dst, host_buf.data(), 0, nbytes);
+                }
+                static int bcast_count = 0;
+                if (bcast_count < 5) {
+                    bcast_count++;
+                    fprintf(stderr, "[META-BROADCAST] subgraph %zu: %zu bytes from GPU%zu to %zu GPUs (tensor=%s)\n",
+                            i, nbytes, exclusive_owner, n_backends - 1, bcast_node->name);
+                }
             }
         }
 
