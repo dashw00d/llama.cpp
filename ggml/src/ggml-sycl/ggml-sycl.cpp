@@ -4020,6 +4020,18 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     const int64_t n_as = ne02;
     const int64_t n_ids = ids->ne[0];
 
+    // --- EP (Expert Parallelism) parameters ---
+    // op_params[1] = expert_offset (first global expert index on this GPU)
+    // op_params[2] = n_local_experts (>0 signals EP mode)
+    const int32_t expert_offset   = dst->op_params[1];
+    const int64_t n_local_experts = ne02;
+    const bool    ep_flag         = (dst->op_params[2] > 0);
+
+    // Pre-zero output for EP: non-owned expert slots must be zero for AllReduce SUM
+    if (ep_flag) {
+        SYCL_CHECK(CHECK_TRY_ERROR(stream->memset(dst->data, 0, ggml_nbytes(dst))));
+    }
+
     const size_t ids_nbytes = ggml_nbytes(ids);
     const char * ids_dev = (const char *) ids->data;
 
@@ -4068,7 +4080,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         }
     }
 
-    if (ne12 == 1 && ggml_sycl_mul_mat_id_decode_fast_path(ctx, src0, src1, dst, ids, ids_host_ptr)) {
+    // Disable fused decode fast path for EP mode — it doesn't handle expert_offset remapping.
+    if (!ep_flag && ne12 == 1 && ggml_sycl_mul_mat_id_decode_fast_path(ctx, src0, src1, dst, ids, ids_host_ptr)) {
         return;
     }
 
@@ -4099,7 +4112,15 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
             for (int64_t id = 0; id < n_ids; id++) {
                 const int32_t i02 = *(const int32_t *) (ids_host_ptr + iid1*ids->nb[1] + id*ids->nb[0]);
-                GGML_ASSERT(i02 >= 0 && i02 < n_as);
+
+                // EP: skip non-local experts (output already pre-zeroed)
+                if (ep_flag) {
+                    if (i02 < expert_offset || i02 >= expert_offset + n_local_experts) {
+                        continue;
+                    }
+                }
+
+                GGML_ASSERT(i02 >= 0);
 
                 const int64_t i11 = id % ne11;
                 const int64_t i12 = iid1;
@@ -4107,7 +4128,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                 const int64_t i1 = id;
                 const int64_t i2 = i12;
 
-            src0_row.data = src0_original + i02*nb02;
+            // EP: remap global expert index to local tensor index
+            const int32_t local_i02 = ep_flag ? (i02 - expert_offset) : i02;
+            src0_row.data = src0_original + local_i02*nb02;
             src1_row.data = src1_original + i11*nb11 + i12*nb12;
             dst_row.data = dst_original + i1*nb1 + i2*nb2;
 
@@ -4121,18 +4144,24 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         src1_row.data = src1_contiguous.get();
         dst_row.data  =  dst_contiguous.get();
 
-        // Single-pass: count tokens per expert in O(n_tokens * n_ids) instead of O(n_as * n_tokens * n_ids)
-        // For Qwen3-30B: n_as=128, n_ids=8 — this reduces 128x iterations to 1x
-        std::vector<int64_t> expert_token_counts(n_as, 0);
+        // Single-pass: count tokens per expert
+        // In EP mode, routing IDs are global but we only compute local experts.
+        // Use global-sized array for counting, then iterate only local range.
+        const int64_t n_experts_total = ep_flag ? (expert_offset + n_local_experts + 256) : n_as; // oversize is fine
+        std::vector<int64_t> expert_token_counts(n_experts_total, 0);
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
             for (int64_t id = 0; id < n_ids; id++) {
                 const int32_t row_id_i = *(const int32_t *) (ids_host_ptr + iid1*ids->nb[1] + id*ids->nb[0]);
-                GGML_ASSERT(row_id_i >= 0 && row_id_i < n_as);
-                expert_token_counts[row_id_i]++;
+                if (row_id_i >= 0 && row_id_i < (int32_t)n_experts_total) {
+                    expert_token_counts[row_id_i]++;
+                }
             }
         }
 
-        for (int64_t i02 = 0; i02 < n_as; i02++) {
+        // In EP mode, iterate only local expert range; otherwise all experts
+        const int64_t i02_begin = ep_flag ? expert_offset : 0;
+        const int64_t i02_end   = ep_flag ? (expert_offset + n_local_experts) : n_as;
+        for (int64_t i02 = i02_begin; i02 < i02_end; i02++) {
             const int64_t num_src1_rows = expert_token_counts[i02];
 
             if (num_src1_rows == 0) {
@@ -4175,7 +4204,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                 });
             }
 
-            src0_row.data = src0_original + i02*nb02;
+            // EP: remap global expert index to local tensor index
+            const int64_t local_i02_batch = ep_flag ? (i02 - expert_offset) : i02;
+            src0_row.data = src0_original + local_i02_batch*nb02;
 
             GGML_ASSERT(nb11 == sizeof(float)*ne10);
             GGML_ASSERT(nb1 == sizeof(float)*ne0);

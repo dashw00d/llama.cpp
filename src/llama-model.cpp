@@ -48,9 +48,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     // const std::regex pattern_qkv_weight("blk\\.\\d*\\.attn_qkv.weight");
     // const std::regex pattern_attn_gate_weight("blk\\.\\d*\\.attn_gate.weight");
 
-    const std::regex pattern_ffn_up_gate_weight("blk\\.\\d*\\.ffn_(up|gate)(_exps)?.weight");
-    const std::regex pattern_ffn_up_gate_bias("blk\\.\\d*\\.ffn_(up|gate)(_exps)?.bias");
-    const std::regex pattern_ffn_down_weight("blk\\.\\d*\\.ffn_down(_exps)?.weight");
+    // EP: expert tensors split on expert dimension (axis 2) — must match BEFORE non-_exps patterns
+    const std::regex pattern_ffn_up_gate_exps_weight("blk\\.\\d*\\.ffn_(up|gate|gate_up)_exps.weight");
+    const std::regex pattern_ffn_down_exps_weight("blk\\.\\d*\\.ffn_down_exps.weight");
+    const std::regex pattern_ffn_up_gate_exps_bias("blk\\.\\d*\\.ffn_(up|gate|gate_up)_exps.bias");
+
+    // TP: non-expert FFN tensors keep original split axes
+    const std::regex pattern_ffn_up_gate_weight("blk\\.\\d*\\.ffn_(up|gate).weight");
+    const std::regex pattern_ffn_up_gate_bias("blk\\.\\d*\\.ffn_(up|gate).bias");
+    const std::regex pattern_ffn_down_weight("blk\\.\\d*\\.ffn_down.weight");
     const std::regex pattern_ffn_down_bias("blk\\.\\d*\\.ffn_down.bias");
     const std::regex pattern_ffn_down_exps_bias("blk\\.\\d*\\.ffn_down_exps.bias");
     const std::regex pattern_output_weight("output\\.weight");
@@ -117,31 +123,46 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         //     return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
         // }
 
-        // FFN
+        // EP: Expert tensors split on expert dimension (axis 2)
+        // Can be disabled with GGML_NO_EP=1 for debugging (falls through to MIRRORED)
+        if (getenv("GGML_NO_EP") == nullptr) {
+            if (std::regex_match(tensor_name, pattern_ffn_up_gate_exps_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+            }
+            if (std::regex_match(tensor_name, pattern_ffn_down_exps_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+            }
+            if (std::regex_match(tensor_name, pattern_ffn_up_gate_exps_bias)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+            }
+            if (std::regex_match(tensor_name, pattern_ffn_down_exps_bias)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+            }
+        }
+
+        // TP: Non-expert FFN tensors — split on weight dimensions
         if (std::regex_match(tensor_name, pattern_ffn_up_gate_weight)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down.weight", "ffn_down_exps.weight");
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down.weight");
         }
         if (std::regex_match(tensor_name, pattern_ffn_up_gate_bias)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down.weight", "ffn_down_exps.weight");
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down.weight");
         }
         if (std::regex_match(tensor_name, pattern_ffn_down_weight)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down.weight", "ffn_down_exps.weight");
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down.weight");
         }
         if (std::regex_match(tensor_name, pattern_ffn_down_bias)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
-        if (std::regex_match(tensor_name, pattern_ffn_down_exps_bias)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_PARTIAL);
-        }
 
         // output
+        // MIRRORED: replicate output weights on all GPUs so logits are not split.
+        // Split logits break backend sampling (each GPU only sees partial vocab).
+        // TODO: implement logits gathering for SPLIT_AXIS_0 to save VRAM.
         if (std::regex_match(tensor_name, pattern_output_weight)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
         if (std::regex_match(tensor_name, pattern_output_bias)) {
-            const ggml_tensor * output_weight = ud->model->get_tensor("output.weight");
-            GGML_ASSERT(output_weight != nullptr);
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
 
         // everything else
@@ -168,7 +189,15 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return std::lcm(n_embd_q, blck_size)/n_embd_q * n_gqa;
         }
 
-        // FFN
+        // EP: Expert tensors split on expert dimension — granularity 1 (each expert is independent)
+        if (std::regex_match(tensor_name, pattern_ffn_up_gate_exps_weight) ||
+                std::regex_match(tensor_name, pattern_ffn_down_exps_weight) ||
+                std::regex_match(tensor_name, pattern_ffn_up_gate_exps_bias) ||
+                std::regex_match(tensor_name, pattern_ffn_down_exps_bias)) {
+            return 1;
+        }
+
+        // TP: Non-expert FFN tensors
         if (std::regex_match(tensor_name, pattern_ffn_up_gate_weight) || std::regex_match(tensor_name, pattern_ffn_up_gate_bias) ||
                 std::regex_match(tensor_name, pattern_ffn_down_weight)) {
             return blck_size;
@@ -187,10 +216,17 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         const int64_t granularity = get_split_granularity(blck_size);
         GGML_ASSERT(ne_full % granularity == 0);
         const float * tensor_split = ud->model->tensor_split();
+        // For SPLIT_AXIS_2 (EP expert dimension), disable rotation entirely.
+        // Rotation breaks expert_offset/n_local calculation — the meta backend
+        // computes expert_offset = sum(ne[0..j-1]) which must be consistent
+        // across all layers. With rotation, layer 0 might have GPU1 owning
+        // experts 42-84 but layer 1 has GPU1 owning experts 43-84.
+        const bool is_ep_split = (split_state.axis == GGML_BACKEND_SPLIT_AXIS_2);
+        const size_t effective_rotation = is_ep_split ? 0 : tc.rotation;
         std::vector<float> tensor_split_scan;
         tensor_split_scan.reserve(ud->n_devices);
         for (size_t j = 0; j < ud->n_devices; j++) {
-            tensor_split_scan.push_back(tensor_split == nullptr ? 0.0f : tensor_split[(j + tc.rotation) % ud->n_devices]);
+            tensor_split_scan.push_back(tensor_split == nullptr ? 0.0f : tensor_split[(j + effective_rotation) % ud->n_devices]);
             if (j > 0) {
                 tensor_split_scan[j] += tensor_split_scan[j - 1];
             }
@@ -203,10 +239,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (high % granularity != 0) {
                 high -= high % granularity;
             }
-            split_state.ne[(j + tc.rotation) % ud->n_devices] = high - low;
+            split_state.ne[(j + effective_rotation) % ud->n_devices] = high - low;
             low = high;
         }
-        split_state.ne[(j + tc.rotation) % ud->n_devices] = ne_full - low;
+        split_state.ne[(j + effective_rotation) % ud->n_devices] = ne_full - low;
     } else {
         memset(split_state.ne, 0, sizeof(split_state.ne));
     }
@@ -3867,7 +3903,6 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
                         layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, 0);
                         // Gate bias: used by expert-padding script to suppress fake experts
-                        // with bias=-1e30, making them unreachable regardless of hidden state sign
                         layer.ffn_gate_inp_b = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED);
 
                         if (n_expert == 0) {
@@ -7411,8 +7446,9 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                             layer.ssm_out        = create_tensor(tn(LLM_TENSOR_SSM_OUT,        "weight", i), { value_dim, n_embd }, 0);
                         }
 
-                        layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", i), { n_embd, n_expert }, 0);
-                        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), { n_ff_exp, n_embd, n_expert }, 0);
+                        layer.ffn_gate_inp   = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", i), { n_embd, n_expert }, 0);
+                        layer.ffn_gate_inp_b = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "bias",   i), { n_expert }, TENSOR_NOT_REQUIRED);
+                        layer.ffn_down_exps  = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), { n_ff_exp, n_embd, n_expert }, 0);
                         create_tensor_gate_up_exps(layer, i, n_embd, n_ff_exp, n_expert, 0);
 
                         // Shared experts
