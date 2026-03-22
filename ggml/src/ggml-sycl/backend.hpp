@@ -26,6 +26,7 @@
 #include "fattn.hpp"
 #include "gla.hpp"
 #include "gated_delta_net.hpp"
+#include "topk-moe.hpp"
 #include "im2col.hpp"
 #include "mmq.hpp"
 #include "mmvq.hpp"
