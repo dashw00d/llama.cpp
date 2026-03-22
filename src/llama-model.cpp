@@ -97,24 +97,28 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_tensor_config = [&]() -> tensor_config {
-        // EP-only mode: skip all TP splits, only split expert tensors.
-        // Use for architectures where TP doesn't work (Qwen35MoE, Jamba, etc.)
-        // but EP does. Set GGML_EP_ONLY=1 to enable.
-        const bool ep_only = (getenv("GGML_EP_ONLY") != nullptr);
-        if (ep_only) {
-            // Only check EP expert patterns, everything else is MIRRORED
-            if (getenv("GGML_NO_EP") == nullptr) {
-                if (std::regex_match(tensor_name, pattern_ffn_up_gate_exps_weight) ||
-                    std::regex_match(tensor_name, pattern_ffn_down_exps_weight) ||
-                    std::regex_match(tensor_name, pattern_ffn_up_gate_exps_bias) ||
-                    std::regex_match(tensor_name, pattern_ffn_down_exps_bias)) {
-                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
-                }
+        // Hybrid EP+layer-split for MoE architectures.
+        // Expert weights → SPLIT_AXIS_2 (EP: all GPUs get different expert subsets)
+        // Non-expert weights → SPLIT_AXIS_0 with full granularity (layer-split:
+        //   entire tensor goes to one GPU based on layer rotation, no splitting)
+        // This avoids TP's VIEW reshape crashes AND avoids MIRRORED compute triplication.
+        // Disable EP with GGML_NO_EP=1 for debugging.
+        const bool has_experts = (ud->model->hparams.n_expert > 0);
+        const bool ep_enabled = has_experts && (getenv("GGML_NO_EP") == nullptr);
+        if (ep_enabled) {
+            // Expert tensors → SPLIT_AXIS_2 (EP across all GPUs)
+            if (std::regex_match(tensor_name, pattern_ffn_up_gate_exps_weight) ||
+                std::regex_match(tensor_name, pattern_ffn_down_exps_weight) ||
+                std::regex_match(tensor_name, pattern_ffn_up_gate_exps_bias) ||
+                std::regex_match(tensor_name, pattern_ffn_down_exps_bias)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
             }
+            // Non-expert tensors → MIRRORED
+            // TODO: layer-split for non-MoE compute requires broadcast at MoE boundaries
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
 
-        // standard attention
+        // standard attention (TP mode — only for non-MoE or when EP is disabled)
         if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
         }
