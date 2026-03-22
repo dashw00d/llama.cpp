@@ -1152,7 +1152,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 continue;
             }
 
-            {
+            // Only apply AllReduce deferral for PARTIAL boundaries, not EXCLUSIVE transitions
+            if (!exclusive_to_ep_transition) {
                 const int i_orig = i;
                 i = get_i_delayed(i);
                 ggml_tensor * delayed_node = cgraph->nodes[i];
@@ -1390,6 +1391,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         // tensors that cross into the next EP subgraph. Finds cross-boundary
         // tensors by checking EP subgraph nodes' src[] for EXCLUSIVE tensors.
         if (subgraph_exclusive && n_backends > 1 && i + 1 < n_subgraphs) {
+            // CRITICAL: sync owner GPU before reading its output.
+            // ggml_backend_graph_compute_async is async — the compute may still
+            // be in-flight when we try to read the output for broadcast.
+            ggml_backend_synchronize(backend_ctx->backend_configs[exclusive_owner].backend);
             // Collect unique EXCLUSIVE tensors consumed by the next subgraph
             auto & bc_owner = backend_ctx->backend_configs[exclusive_owner];
             size_t next_start = bc_owner.cgraphs[i + 1].offset;
@@ -1459,6 +1464,11 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     fprintf(stderr, "[META-BROADCAST] subgraph %zu: %zu bytes from GPU%zu (tensor=%s, idx=%zu)\n",
                             i, nbytes, exclusive_owner, owner_tensor->name, idx);
                 }
+            }
+            // Sync all GPUs after broadcast to ensure data is available before EP compute
+            for (size_t j = 0; j < n_backends; j++) {
+                if (j == exclusive_owner) continue;
+                ggml_backend_synchronize(backend_ctx->backend_configs[j].backend);
             }
         }
 
