@@ -1133,18 +1133,16 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
             if (!defer_ep_allreduce && split_state.axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
                 max_tmp_size = std::max(max_tmp_size, ggml_nbytes(node));
             }
-            // Split subgraph at EXCLUSIVE→MIRRORED/PARTIAL transitions.
-            // This creates a boundary between DeltaNet/attention (EXCLUSIVE, one GPU)
-            // and MoE routing (MIRRORED/PARTIAL, all GPUs), enabling broadcast between them.
+            // Split subgraph at MoE entry: when the NEXT node is a MUL_MAT that feeds
+            // into MUL_MAT_ID with SPLIT_AXIS_2 (expert weights). This creates one
+            // boundary per layer between DeltaNet/attention and MoE, not hundreds.
             bool exclusive_to_ep_transition = false;
-            if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE && i + 1 < cgraph->n_nodes) {
-                ggml_tensor * next = cgraph->nodes[i + 1];
-                if (next->view_src == nullptr || !ggml_backend_buffer_is_host(next->view_src->buffer)) {
-                    ggml_backend_meta_split_state next_state = ggml_backend_meta_get_split_state(next, false);
-                    if (next_state.axis != GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE) {
-                        exclusive_to_ep_transition = true;
-                    }
-                }
+            // Split before MoE gate: when the current node is the MoE gate logits
+            // (name contains "ffn_moe_logits"), this is the transition from
+            // DeltaNet/attention (EXCLUSIVE) to MoE routing (needs all GPUs).
+            if (node->name && strstr(node->name, "ffn_moe_logits") != nullptr &&
+                strstr(node->name, "biased") == nullptr) {
+                exclusive_to_ep_transition = true;
             }
 
             const bool new_subgraph = i + 1 == cgraph->n_nodes ||
