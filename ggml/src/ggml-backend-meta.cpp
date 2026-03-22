@@ -1345,48 +1345,30 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     auto t_total_start = std::chrono::high_resolution_clock::now();
 
     for (size_t i = 0; i < n_subgraphs; i++) {
-        // Determine if this subgraph is EXCLUSIVE (non-MoE, one GPU only)
-        // by checking the split state of the last ORIGINAL node (not per-GPU copy).
+        // Compute mask: determine which GPU should run this subgraph.
+        // For DeltaNet/attention subgraphs (before MoE), only the owning GPU
+        // runs the compute. Ownership is determined by layer number (round-robin).
+        // For MoE subgraphs (after the attn_post_norm split), all GPUs run.
         bool subgraph_exclusive = false;
         size_t exclusive_owner = 0;
 
         if (n_backends > 1) {
-            // Get the original graph node index for this subgraph's last node
             auto & bc0 = backend_ctx->backend_configs[0];
             size_t i_node_start = bc0.cgraphs[i].offset;
             size_t i_node_stop = (i + 1 < n_subgraphs) ? bc0.cgraphs[i + 1].offset : cgraph->n_nodes;
+
+            // Check if this subgraph ends at attn_post_norm (EXCLUSIVE subgraph).
+            // The subgraph split creates boundaries at attn_post_norm-N, so the
+            // subgraph ENDING at attn_post_norm is the DeltaNet/attention subgraph.
             if (i_node_stop > i_node_start) {
-                ggml_tensor * orig_last = cgraph->nodes[i_node_stop - 1];
-                if (orig_last->buffer && ggml_backend_buffer_is_meta(orig_last->buffer)) {
-                    ggml_backend_meta_split_state last_state = ggml_backend_meta_get_split_state(orig_last, true);
-                    if (last_state.axis == GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE) {
-                        subgraph_exclusive = true;
-                        // Find owner by looking at WEIGHT tensors (they have ne[owner]>0, ne[others]=0).
-                        // Compute tensors have ne[j]>0 for all GPUs (full allocation).
-                        bool found_owner = false;
-                        for (size_t ni = i_node_start; ni < i_node_stop && !found_owner; ni++) {
-                            ggml_tensor * n = cgraph->nodes[ni];
-                            for (int s = 0; s < GGML_MAX_SRC; s++) {
-                                if (n->src[s] == nullptr) break;
-                                ggml_tensor * src = n->src[s];
-                                if (src->buffer && ggml_backend_buffer_is_meta(src->buffer) &&
-                                    ggml_backend_buffer_get_usage(src->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
-                                    ggml_backend_meta_split_state ws = ggml_backend_meta_get_split_state(src, true);
-                                    if (ws.axis == GGML_BACKEND_SPLIT_AXIS_EXCLUSIVE) {
-                                        // Check which GPU has non-zero ne (the owner)
-                                        int zero_count = 0;
-                                        for (size_t j = 0; j < n_backends; j++) {
-                                            if (ws.ne[j] == 0) zero_count++;
-                                            else exclusive_owner = j;
-                                        }
-                                        if (zero_count > 0) { found_owner = true; break; }
-                                    }
-                                }
-                            }
-                        }
-                        if (!found_owner) {
-                            exclusive_owner = 0; // fallback
-                        }
+                ggml_tensor * last_node = cgraph->nodes[i_node_stop - 1];
+                if (last_node->name && strstr(last_node->name, "attn_post_norm") != nullptr) {
+                    subgraph_exclusive = true;
+                    // Extract layer number from tensor name "attn_post_norm-N"
+                    const char * dash = strrchr(last_node->name, '-');
+                    if (dash) {
+                        int layer = atoi(dash + 1);
+                        exclusive_owner = layer % n_backends;
                     }
                 }
             }
