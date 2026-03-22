@@ -97,6 +97,23 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_tensor_config = [&]() -> tensor_config {
+        // EP-only mode: skip all TP splits, only split expert tensors.
+        // Use for architectures where TP doesn't work (Qwen35MoE, Jamba, etc.)
+        // but EP does. Set GGML_EP_ONLY=1 to enable.
+        const bool ep_only = (getenv("GGML_EP_ONLY") != nullptr);
+        if (ep_only) {
+            // Only check EP expert patterns, everything else is MIRRORED
+            if (getenv("GGML_NO_EP") == nullptr) {
+                if (std::regex_match(tensor_name, pattern_ffn_up_gate_exps_weight) ||
+                    std::regex_match(tensor_name, pattern_ffn_down_exps_weight) ||
+                    std::regex_match(tensor_name, pattern_ffn_up_gate_exps_bias) ||
+                    std::regex_match(tensor_name, pattern_ffn_down_exps_bias)) {
+                    return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+                }
+            }
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+
         // standard attention
         if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");

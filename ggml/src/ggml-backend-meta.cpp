@@ -1777,6 +1777,7 @@ struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const str
             case GGML_OP_ADD_REL_POS:
             case GGML_OP_RWKV_WKV6:
             case GGML_OP_GATED_LINEAR_ATTN:
+            case GGML_OP_GATED_DELTA_NET:
             case GGML_OP_RWKV_WKV7:
             case GGML_OP_SOLVE_TRI: {
                 split_state = handle_generic(src_split_states, /*scalar_only =*/ true);
@@ -1815,8 +1816,9 @@ struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const str
                 }
             } break;
             default: {
-                GGML_ABORT("ggml op not implemented: %s", ggml_op_name(tensor->op));
-                split_state = {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}};
+                fprintf(stderr, "META BACKEND: unhandled op %s (%d), falling back to handle_generic\n",
+                        ggml_op_name(tensor->op), (int)tensor->op);
+                split_state = handle_generic(src_split_states, /*scalar_only =*/ true);
             } break;
         }
         if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
@@ -1837,6 +1839,13 @@ struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(const str
                     for (size_t j = 0; j < n_bufs; j++) {
                         // Take over ratio from src:
                         split_state.ne[j] = src_split_states[i].ne[j] * tensor->ne[split_state.axis];
+                        if (split_state.ne[j] % tensor->src[i]->ne[src_split_states[i].axis] != 0) {
+                            fprintf(stderr, "META SPLIT ASSERT FAIL: op=%s tensor=%s ne[%d]=%ld src[%zu]=%s src_ne[%d]=%ld split_ne[%zu]=%ld\n",
+                                    ggml_op_name(tensor->op), tensor->name, split_state.axis,
+                                    (long)tensor->ne[split_state.axis], i, tensor->src[i]->name,
+                                    src_split_states[i].axis, (long)tensor->src[i]->ne[src_split_states[i].axis],
+                                    j, (long)split_state.ne[j]);
+                        }
                         GGML_ASSERT(split_state.ne[j] % tensor->src[i]->ne[src_split_states[i].axis] == 0);
                         split_state.ne[j] /= tensor->src[i]->ne[src_split_states[i].axis];
                     }
