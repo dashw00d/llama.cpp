@@ -3294,7 +3294,8 @@ inline bool ggml_sycl_supports_reorder_mmvq(enum ggml_type type) {
         (std::getenv("GGML_SYCL_DEBUG_Q4K_CPU_AOS") != nullptr ||
          std::getenv("GGML_SYCL_DEBUG_Q4K_ESIMD_F32") != nullptr ||
          std::getenv("GGML_SYCL_DEBUG_Q4K_ESIMD_LIVE") != nullptr ||
-         std::getenv("GGML_SYCL_DEBUG_Q4K_XMX_LIVE") != nullptr)) {
+         std::getenv("GGML_SYCL_DEBUG_Q4K_XMX_LIVE") != nullptr ||
+         std::getenv("GGML_SYCL_DEBUG_Q4K_XMX_FP16") != nullptr)) {
         return false;
     }
     switch (type) {

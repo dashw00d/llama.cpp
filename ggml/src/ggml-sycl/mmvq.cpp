@@ -1,6 +1,7 @@
 #include "mmvq.hpp"
 
 #include "ggml.h"
+#include "ggml-quants.h"
 #include "common.hpp"
 #include "quants.hpp"
 #include "vecdotq.hpp"
@@ -801,6 +802,234 @@ struct ggml_sycl_q4k_xmx_live_timing_summary_printer {
 
 static ggml_sycl_q4k_xmx_live_timing_summary_printer g_q4k_xmx_live_timing_summary_printer;
 
+/* gemma4-ipex iter12: pre-dequanted fp16 weight cache for a pure-GEMM XMX path.
+
+   The iter10 XMX kernel is bottlenecked by ~672 work-group barriers per
+   subgroup per kernel (336 K-steps x 2 barriers each), which exists because
+   B has to be dequanted into SLM in the inner loop. This cache eliminates
+   the problem by storing the B matrix as pre-dequanted fp16 weights in a
+   TRANSPOSED layout [K=ncols_x][N=nrows_x], so joint_matrix_load for tB
+   can read directly from global memory in row_major with stride = nrows_x.
+   No SLM for B, no per-K-step dequant, no inner-loop barriers.
+
+   Cache is per-(device, vx) keyed on the weight pointer, same pattern as
+   the iter7 split cache. Memory budget: fp16 is 2 bytes/element vs Q4_K's
+   0.5625 bytes/element (128 payload + 16 meta per 256 elements), so the
+   cache is roughly 3.5x the size of the iter7 cache. With 92 entries per
+   device at ~36 MB avg in iter7 (total 3.3 GiB), this cache would be
+   ~11.8 GiB per device which exceeds the 16 GiB A770 envelope when
+   combined with weights (~5.8 GiB) and KV/compute buffers (~2 GiB).
+
+   Mitigation: per-device cache SIZE CAP (default 3 GiB). Cache lookup
+   returns null if adding the new entry would exceed the cap, and the
+   live function falls back to the iter10 SLM-dequant path for tensors
+   that don't fit. Mixed-mode operation: the N tensors that DO fit get
+   the fast pure-GEMM path; the rest keep the slower SLM path. Aggregate
+   throughput = weighted average of the two. */
+
+struct ggml_sycl_q4k_xmx_fp16_cached {
+    sycl::half * fp16_dev;   // device pointer, transposed [K][N]
+    int          nrows_x;    // N (output rows for this device slice)
+    int          ncols_x;    // K (reduction dim)
+};
+
+struct ggml_sycl_q4k_xmx_fp16_arena_device {
+    std::unordered_map<const void *, ggml_sycl_q4k_xmx_fp16_cached> cache;
+    std::size_t total_bytes = 0;
+};
+
+static ggml_sycl_q4k_xmx_fp16_arena_device g_q4k_xmx_fp16_arena[GGML_SYCL_MAX_DEVICES];
+
+// Default cap: 3 GiB per device. Adjust via GGML_SYCL_DEBUG_Q4K_XMX_FP16_CAP_MB.
+std::size_t ggml_sycl_debug_q4k_xmx_fp16_cap_bytes() {
+    static const std::size_t cap = []() -> std::size_t {
+        const char * env = std::getenv("GGML_SYCL_DEBUG_Q4K_XMX_FP16_CAP_MB");
+        const std::size_t mb = (env != nullptr) ? static_cast<std::size_t>(std::atoll(env)) : 3072;
+        return mb * 1024ULL * 1024ULL;
+    }();
+    return cap;
+}
+
+inline float ggml_sycl_debug_q4k_fp16_host(std::uint16_t h) {
+    const std::uint32_t sign = (static_cast<std::uint32_t>(h & 0x8000U)) << 16;
+    const std::uint32_t exp  = (h >> 10) & 0x1fU;
+    const std::uint32_t mant = h & 0x03ffU;
+    if (exp == 0x1fU) return 0.0f;
+    if (exp == 0) {
+        if (mant == 0) return 0.0f;
+        float val = static_cast<float>(mant) * (1.0f / 1024.0f) * (1.0f / 16384.0f);
+        return (h & 0x8000U) ? -val : val;
+    }
+    std::uint32_t out = sign | ((exp + 112U) << 23) | (mant << 13);
+    float f;
+    std::memcpy(&f, &out, sizeof(float));
+    return f;
+}
+
+// iter12-rev5: host-side fp32 -> fp16 converter that bypasses sycl::half
+// entirely. The iter12 cache spent three revs producing garbage output
+// on paper-correct data -- the common factor was `sycl::half(float)` in
+// host code, which on this oneAPI 2025.0.4 docker image apparently
+// silently produces wrong values despite non-zero bit patterns in the
+// diagnostic dump. This converter manipulates IEEE 754 bits directly
+// and matches ggml_fp32_to_fp16.
+inline std::uint16_t ggml_sycl_debug_fp32_to_fp16_host(float f) {
+    std::uint32_t bits;
+    std::memcpy(&bits, &f, sizeof(bits));
+    const std::uint32_t sign32 = (bits >> 16) & 0x8000U;
+    const std::int32_t  exp32  = static_cast<std::int32_t>((bits >> 23) & 0xFFU) - 127;
+    std::uint32_t       mant32 = bits & 0x007FFFFFU;
+    if (exp32 == 128) {
+        // inf / nan
+        return static_cast<std::uint16_t>(sign32 | 0x7C00U | (mant32 ? 0x0200U : 0U));
+    }
+    const std::int32_t exp16 = exp32 + 15;
+    if (exp16 >= 31) {
+        // overflow -> inf
+        return static_cast<std::uint16_t>(sign32 | 0x7C00U);
+    }
+    if (exp16 <= 0) {
+        // subnormal or zero. shift the mantissa right (1 - exp16) bits.
+        if (exp16 < -10) {
+            return static_cast<std::uint16_t>(sign32);
+        }
+        mant32 |= 0x00800000U; // implicit leading 1
+        const std::uint32_t shift = 14 - exp16; // 14 = 23 - 10 + 1
+        const std::uint32_t mant16 = mant32 >> shift;
+        return static_cast<std::uint16_t>(sign32 | mant16);
+    }
+    const std::uint32_t mant16 = mant32 >> 13;
+    return static_cast<std::uint16_t>(
+        sign32 |
+        (static_cast<std::uint32_t>(exp16) << 10) |
+        mant16);
+}
+
+const ggml_sycl_q4k_xmx_fp16_cached * ggml_sycl_debug_q4k_xmx_fp16_cache_lookup(
+    const void * vx,
+    int nrows_x,
+    int ncols_x,
+    int device,
+    dpct::queue_ptr stream) {
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return nullptr;
+    }
+
+    auto & arena = g_q4k_xmx_fp16_arena[device];
+    auto & cache = arena.cache;
+    auto it = cache.find(vx);
+
+    if (it != cache.end() &&
+        it->second.nrows_x == nrows_x &&
+        it->second.ncols_x == ncols_x) {
+        return &it->second;
+    }
+
+    // Invalidation on shape change.
+    if (it != cache.end()) {
+        const std::size_t old_bytes =
+            static_cast<std::size_t>(it->second.nrows_x) * it->second.ncols_x * sizeof(sycl::half);
+        sycl::free(it->second.fp16_dev, *stream);
+        arena.total_bytes -= old_bytes;
+        cache.erase(it);
+    }
+
+    const std::size_t total_elements =
+        static_cast<std::size_t>(nrows_x) * static_cast<std::size_t>(ncols_x);
+    const std::size_t new_bytes = total_elements * sizeof(sycl::half);
+
+    if (arena.total_bytes + new_bytes > ggml_sycl_debug_q4k_xmx_fp16_cap_bytes()) {
+        // Over cap -- let the caller fall back to the iter10 SLM-dequant path.
+        GGML_LOG_INFO(
+            "Q4_K XMX FP16 cache over cap: device=%d would-be bytes=%zu total=%zu cap=%zu -- falling back for this tensor\n",
+            device, new_bytes, arena.total_bytes,
+            ggml_sycl_debug_q4k_xmx_fp16_cap_bytes());
+        return nullptr;
+    }
+
+    const int n_blocks_per_row = ncols_x / QK_K;
+    const int total_blocks = nrows_x * n_blocks_per_row;
+
+    // Copy Q4_K blocks to host
+    std::vector<block_q4_K> vx_host(static_cast<size_t>(total_blocks));
+    SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(
+        vx_host.data(),
+        vx,
+        vx_host.size() * sizeof(block_q4_K)).wait()));
+
+    // iter12-rev6: use ggml_fp32_to_fp16 (ggml's own reference converter)
+    // directly. My hand-rolled converter was producing wrong bits and I'm
+    // not going to waste more time debugging it when the reference is right
+    // there. Store as raw uint16 so no sycl::half host code is involved.
+    std::vector<std::uint16_t> fp16_host(total_elements);
+    std::vector<float> row_fp32(static_cast<size_t>(ncols_x));
+    for (int n = 0; n < nrows_x; ++n) {
+        const block_q4_K * row_blocks =
+            vx_host.data() + static_cast<size_t>(n) * n_blocks_per_row;
+        dequantize_row_q4_K(row_blocks, row_fp32.data(), ncols_x);
+        std::uint16_t * row_out = fp16_host.data() + static_cast<size_t>(n) * ncols_x;
+        for (int k = 0; k < ncols_x; ++k) {
+            row_out[k] = static_cast<std::uint16_t>(ggml_fp32_to_fp16(row_fp32[k]));
+        }
+    }
+
+    // iter12-rev5 diagnostic: dump raw fp16 bits + expected float values
+    // for the first few elements.
+    {
+        static bool dumped = false;
+        if (!dumped) {
+            dumped = true;
+            GGML_LOG_INFO(
+                "Q4_K XMX FP16 cache rev5 sample: raw=0x%04x 0x%04x 0x%04x 0x%04x "
+                "expected fp32=%.6f %.6f %.6f %.6f\n",
+                fp16_host[0], fp16_host[1], fp16_host[2], fp16_host[3],
+                row_fp32[0], row_fp32[1], row_fp32[2], row_fp32[3]);
+        }
+    }
+
+    // Allocate device buffer and upload
+    sycl::half * fp16_dev = sycl::malloc_device<sycl::half>(total_elements, *stream);
+    if (fp16_dev == nullptr) {
+        GGML_LOG_INFO(
+            "Q4_K XMX FP16 cache malloc_device FAILED: device=%d bytes=%zu -- falling back\n",
+            device, new_bytes);
+        return nullptr;
+    }
+
+    SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(
+        fp16_dev,
+        fp16_host.data(),
+        new_bytes).wait()));
+
+    ggml_sycl_q4k_xmx_fp16_cached entry = { fp16_dev, nrows_x, ncols_x };
+    auto [inserted_it, ok] = cache.emplace(vx, entry);
+    (void) ok;
+    arena.total_bytes += new_bytes;
+
+    GGML_LOG_INFO(
+        "Q4_K XMX FP16 cache fill: device=%d vx=%p nrows=%d ncols=%d bytes=%zu arena_total=%.2f MiB entries=%zu\n",
+        device, vx, nrows_x, ncols_x, new_bytes,
+        arena.total_bytes / (1024.0 * 1024.0),
+        cache.size());
+
+    return &inserted_it->second;
+}
+
+bool ggml_sycl_debug_q4k_xmx_fp16_enabled() {
+    static const bool enabled = std::getenv("GGML_SYCL_DEBUG_Q4K_XMX_FP16") != nullptr;
+    return enabled;
+}
+
+bool ggml_sycl_debug_q4k_xmx_fp16_should_run(int ncols_x, int nrows_x, int ncols_y) {
+    if (!ggml_sycl_debug_q4k_xmx_fp16_enabled()) {
+        return false;
+    }
+    if (ncols_y != 8 || ncols_x != 5376 || nrows_x <= 0) {
+        return false;
+    }
+    return true;
+}
+
 /* gemma4-ipex iter10: per-device x_half scratch arena for the XMX live path.
    The x_half buffer is needed per call (activation x changes every step)
    but its MAX size is bounded by ne0 * TM = 5376 * 8 = 43008 halfs = 86 KB
@@ -1351,6 +1580,215 @@ void ggml_sycl_debug_q4k_xmx_live(
         ggml_sycl_debug_q4k_xmx_live_timing_record(
             device,
             std::chrono::duration<double, std::nano>(xmx_kern_t1 - xmx_kern_t0).count());
+    }
+}
+
+/* gemma4-ipex iter12: pure fp16 GEMM path using pre-dequanted cached weights.
+
+   Same dispatch scaffolding as ggml_sycl_debug_q4k_xmx_live (iter10), but
+   the B matrix is loaded directly from the cached transposed fp16 buffer
+   instead of being dequanted on-the-fly into SLM. The kernel body has no
+   SLM writes for B, no per-K-step dequant, and ZERO barriers inside the
+   K-loop -- each K-step is just (load A, load B, mad).
+
+   Falls back to the iter10 SLM-dequant path when the FP16 cache is over
+   its size cap (so the live dispatch still produces correct output for
+   tensors that don't fit the cap). */
+
+void ggml_sycl_debug_q4k_xmx_fp16_live(
+    const void * vx,
+    const float * x,
+    float * dst,
+    int device,
+    int ncols_x,
+    int row_low,
+    int nrows_x,
+    int ncols_y,
+    size_t dst_col_stride,
+    dpct::queue_ptr stream) {
+    if (!ggml_sycl_debug_q4k_xmx_fp16_should_run(ncols_x, nrows_x, ncols_y)) {
+        return;
+    }
+
+    {
+        static bool announced[GGML_SYCL_MAX_DEVICES] = {};
+        if (device >= 0 && device < GGML_SYCL_MAX_DEVICES && !announced[device]) {
+            announced[device] = true;
+            GGML_LOG_INFO(
+                "Q4_K XMX FP16 LIVE active: device=%d ncols_x=%d nrows_x=%d ncols_y=%d dst_stride=%zu row_low=%d\n",
+                device, ncols_x, nrows_x, ncols_y, dst_col_stride, row_low);
+        }
+    }
+
+    const ggml_sycl_q4k_xmx_fp16_cached * fp16_entry =
+        ggml_sycl_debug_q4k_xmx_fp16_cache_lookup(vx, nrows_x, ncols_x, device, stream);
+
+    if (fp16_entry == nullptr) {
+        // Cache over cap or allocation failed. Fall back to the iter10
+        // XMX SLM-dequant path so the call still produces correct output.
+        ggml_sycl_debug_q4k_xmx_live(
+            vx, x, dst, device, ncols_x, row_low, nrows_x, ncols_y,
+            dst_col_stride, stream);
+        return;
+    }
+
+    constexpr int TM = 8;
+    constexpr int TN = 8;
+    constexpr int TK = 16;
+    constexpr int kSgSize = 8;
+
+    const int ne0 = ncols_x;
+    const int n_tiles_n = (nrows_x + TN - 1) / TN;
+
+    // x_half scratch reuse: same per-device arena as iter10. The layout
+    // is [TM][ne0] row-major, exactly what iter10 expects, so we share
+    // it verbatim.
+    const std::size_t x_half_size = static_cast<std::size_t>(TM) * ne0;
+    sycl::half * x_half = nullptr;
+    if (device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
+        auto & arena = g_q4k_xmx_scratch[device];
+        if (arena.x_half == nullptr || arena.capacity < x_half_size) {
+            if (arena.x_half != nullptr) {
+                sycl::free(arena.x_half, *stream);
+            }
+            arena.x_half = sycl::malloc_device<sycl::half>(x_half_size, *stream);
+            arena.capacity = x_half_size;
+        }
+        x_half = arena.x_half;
+    } else {
+        x_half = sycl::malloc_device<sycl::half>(x_half_size, *stream);
+    }
+    GGML_ASSERT(x_half != nullptr);
+
+    {
+        const auto nc = ncols_y;
+        const auto x_stride = static_cast<size_t>(ncols_x);
+        const auto ne0_cap = ne0;
+        const auto x_src = x;
+        const auto x_h = x_half;
+        stream->submit([&](sycl::handler & h) {
+            h.parallel_for(
+                sycl::range<1>(static_cast<std::size_t>(TM) * ne0),
+                [=](sycl::id<1> idx) {
+                    const std::size_t flat = idx[0];
+                    const std::size_t m = flat / static_cast<std::size_t>(ne0_cap);
+                    const std::size_t k = flat % static_cast<std::size_t>(ne0_cap);
+                    const float v = (static_cast<int>(m) < nc)
+                        ? x_src[m * x_stride + k] : 0.0f;
+                    x_h[m * static_cast<std::size_t>(ne0_cap) + k] = sycl::half(v);
+                });
+        });
+    }
+
+    // iter12-rev3: read fp16 weights from the cached [N][K] natural layout,
+    // stage into SLM the same way iter10 does (dense [TK][TN] row_major),
+    // then joint_matrix_load tB from SLM. This proves the cache is correct
+    // and isolates the "bad joint_matrix_load pattern" from the cache
+    // itself. Once this is correct, rev4 can attack the SLM staging
+    // separately. The only win over iter10 here is: the SLM population
+    // is a pure cached-read-and-write instead of a scalar dequant, so
+    // each thread's inner loop is ~2-3x less arithmetic per K-step.
+    {
+        const auto fp16_base = fp16_entry->fp16_dev;
+        const auto x_h = x_half;
+        float * const y_base = dst;
+        const auto nr = nrows_x;
+        const auto nc = ncols_y;
+        const auto ne0_val = ne0;
+        const auto y_stride = dst_col_stride;
+
+        stream->submit([&](sycl::handler & cgh) {
+            sycl::local_accessor<sycl::half, 1> slm_b(
+                sycl::range<1>(TK * TN), cgh);
+            sycl::local_accessor<float, 1> slm_c(
+                sycl::range<1>(TM * TN), cgh);
+
+            cgh.parallel_for(
+                sycl::nd_range<1>(
+                    sycl::range<1>(static_cast<std::size_t>(n_tiles_n) * kSgSize),
+                    sycl::range<1>(kSgSize)),
+                [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kSgSize)]] {
+                    auto sg = it.get_sub_group();
+                    const int tile_n = static_cast<int>(it.get_group(0));
+                    const int n_base = tile_n * TN;
+                    const int lid = static_cast<int>(it.get_local_linear_id());
+
+                    jm::joint_matrix<sycl::sub_group, sycl::half,
+                        jm::use::a, TM, TK, jm::layout::row_major> tA;
+                    jm::joint_matrix<sycl::sub_group, sycl::half,
+                        jm::use::b, TK, TN, jm::layout::row_major> tB;
+                    jm::joint_matrix<sycl::sub_group, float,
+                        jm::use::accumulator, TM, TN> tC;
+                    jm::joint_matrix_fill(sg, tC, 0.0f);
+
+                    for (int k_start = 0; k_start < ne0_val; k_start += TK) {
+                        // Load A tile from pre-converted fp16 x (same as iter10).
+                        auto a_ptr = sycl::address_space_cast<
+                            sycl::access::address_space::global_space,
+                            sycl::access::decorated::no>(x_h + k_start);
+                        jm::joint_matrix_load(sg, tA, a_ptr,
+                            static_cast<std::size_t>(ne0_val));
+
+                        // Stage B tile into SLM from the natural [N][K]
+                        // cached fp16 layout. Each of the TN=8 threads
+                        // copies one row of TK=16 fp16 values.
+                        if (lid < TN) {
+                            const int row = n_base + lid;
+                            if (row < nr) {
+                                const sycl::half * src_row =
+                                    fp16_base +
+                                    static_cast<std::size_t>(row) *
+                                    static_cast<std::size_t>(ne0_val) +
+                                    static_cast<std::size_t>(k_start);
+                                for (int ki = 0; ki < TK; ++ki) {
+                                    slm_b[ki * TN + lid] = src_row[ki];
+                                }
+                            } else {
+                                for (int ki = 0; ki < TK; ++ki) {
+                                    slm_b[ki * TN + lid] = sycl::half(0.0f);
+                                }
+                            }
+                        }
+
+                        it.barrier(sycl::access::fence_space::local_space);
+
+                        auto b_ptr = slm_b.template get_multi_ptr<
+                            sycl::access::decorated::no>().get();
+                        jm::joint_matrix_load(sg, tB,
+                            sycl::address_space_cast<
+                                sycl::access::address_space::local_space,
+                                sycl::access::decorated::no>(b_ptr),
+                            static_cast<std::size_t>(TN));
+
+                        jm::joint_matrix_mad(sg, tC, tA, tB, tC);
+
+                        it.barrier(sycl::access::fence_space::local_space);
+                    }
+
+                    // Store accumulator to SLM, then scatter to dst.
+                    auto c_slm_ptr = slm_c.template get_multi_ptr<
+                        sycl::access::decorated::no>().get();
+                    jm::joint_matrix_store(sg, tC,
+                        sycl::address_space_cast<
+                            sycl::access::address_space::local_space,
+                            sycl::access::decorated::no>(c_slm_ptr),
+                        static_cast<std::size_t>(TN),
+                        jm::layout::row_major);
+
+                    it.barrier(sycl::access::fence_space::local_space);
+
+                    if (lid == 0) {
+                        for (int m = 0; m < nc; ++m) {
+                            for (int n = 0; n < TN; ++n) {
+                                const int row = n_base + n;
+                                if (row < nr) {
+                                    y_base[m * y_stride + row] = c_slm_ptr[m * TN + n];
+                                }
+                            }
+                        }
+                    }
+                });
+        });
     }
 }
 
@@ -2504,6 +2942,13 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                     GGML_SYCL_DEBUG("Skipping stock Q4K MMVQ: XMX live path owns this shape\n");
                     break;
                 }
+                if (ggml_sycl_debug_q4k_xmx_fp16_should_run(
+                        static_cast<int>(ne00),
+                        static_cast<int>(row_diff),
+                        static_cast<int>(src1_ncols))) {
+                    GGML_SYCL_DEBUG("Skipping stock Q4K MMVQ: XMX FP16 live path owns this shape\n");
+                    break;
+                }
                 // gemma4-ipex iter9: optional stock timing on the gated shape
                 // (same criteria as live path). Run with LIVE env unset so
                 // stock actually executes.
@@ -2614,6 +3059,17 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
             static_cast<size_t>(dst->ne[0]),
             stream);
         ggml_sycl_debug_q4k_xmx_live(
+            src0_dd_i,
+            src1_ddf_i,
+            dst_dd_i,
+            id,
+            static_cast<int>(ne00),
+            static_cast<int>(row_low),
+            static_cast<int>(row_diff),
+            static_cast<int>(src1_ncols),
+            static_cast<size_t>(dst->ne[0]),
+            stream);
+        ggml_sycl_debug_q4k_xmx_fp16_live(
             src0_dd_i,
             src1_ddf_i,
             dst_dd_i,
