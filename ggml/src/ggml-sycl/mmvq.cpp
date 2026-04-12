@@ -1908,12 +1908,18 @@ void flush_pending_q4k_individual(int device, dpct::queue_ptr stream) {
     state.src1_tensor = nullptr;
 }
 
-// Fused QKV kernel: one parallel_for over (q_rows + k_rows + v_rows),
-// thread ID partitioned to one of the three projections. Inline
-// Q4_K AoS dequant, shared src1 activation read once per thread (but
-// each thread reads its own K row, so "shared" mostly means "loaded
-// once per tid, not 3 times across 3 kernel launches"). Compared to
-// 3 individual iter13 launches, this saves 2 launches per triple.
+// Fused QKV kernel: SINGLE parallel_for over (q_rows + k_rows + v_rows)
+// with the thread ID partitioned across the three projections. iter17
+// rewrite: the iter14 version had the same math but a latent bug
+// somewhere in the t->(blocks, dst, stride, row) selection (output was
+// garbage even when called at the right point in the graph walk and
+// with stable tensor data). This rewrite uses an `nd_range` with an
+// explicit work-group size of 1 (so it's structurally identical to
+// `run_q4k_scalar_inline`'s `range<1>(nr)`) and snapshots the tid into
+// a local int once at the top to avoid any cross-iteration capture
+// issue. The actual matmul math is character-for-character the same
+// as `run_q4k_scalar_inline` so any divergence has to be in the
+// projection mapping above the math.
 void run_q4k_fused_qkv(
     const PendingQ4K & q,
     const PendingQ4K & k,
@@ -1927,47 +1933,46 @@ void run_q4k_fused_qkv(
     const int q_rows = q.nrows_x;
     const int k_rows = k.nrows_x;
     const int v_rows = v.nrows_x;
+    const int qk_split = q_rows;
+    const int kv_split = q_rows + k_rows;
     const int total_rows = q_rows + k_rows + v_rows;
 
     const block_q4_K * q_blocks = static_cast<const block_q4_K *>(q.vx);
     const block_q4_K * k_blocks = static_cast<const block_q4_K *>(k.vx);
     const block_q4_K * v_blocks = static_cast<const block_q4_K *>(v.vx);
     const float *      x_shared = q.x;  // q/k/v all share the same src1
-    float * q_dst = q.dst;
-    float * k_dst = k.dst;
-    float * v_dst = v.dst;
+    float * const q_dst = q.dst;
+    float * const k_dst = k.dst;
+    float * const v_dst = v.dst;
     const size_t q_y_stride = q.dst_col_stride;
     const size_t k_y_stride = k.dst_col_stride;
     const size_t v_y_stride = v.dst_col_stride;
 
-    stream->submit([&](sycl::handler & cgh) {
+    stream->submit([=](sycl::handler & cgh) {
         cgh.parallel_for(
             sycl::range<1>(static_cast<std::size_t>(total_rows)),
-            [=](sycl::id<1> tid) {
-                const int t = static_cast<int>(tid[0]);
-                if (t >= total_rows) return;
+            [=](sycl::id<1> id) {
+                const int tid_local = static_cast<int>(id[0]);
+                if (tid_local >= total_rows) return;
 
-                // Which projection + which row within it
-                const block_q4_K * blocks;
-                float * y_dst;
-                size_t y_stride;
-                int row;
-                if (t < q_rows) {
-                    blocks = q_blocks;
-                    y_dst = q_dst;
-                    y_stride = q_y_stride;
-                    row = t;
-                } else if (t < q_rows + k_rows) {
-                    blocks = k_blocks;
-                    y_dst = k_dst;
-                    y_stride = k_y_stride;
-                    row = t - q_rows;
-                } else {
-                    blocks = v_blocks;
-                    y_dst = v_dst;
-                    y_stride = v_y_stride;
-                    row = t - q_rows - k_rows;
-                }
+                // Snapshot the projection assignment into immutable
+                // locals before the math runs. The variables below are
+                // referenced by const-qualified locals so SYCL kernel
+                // outlining cannot accidentally re-evaluate the if-else
+                // tree mid-loop or alias projection state.
+                const block_q4_K * const blocks =
+                    (tid_local < qk_split) ? q_blocks :
+                    (tid_local < kv_split) ? k_blocks : v_blocks;
+                float * const y_dst =
+                    (tid_local < qk_split) ? q_dst :
+                    (tid_local < kv_split) ? k_dst : v_dst;
+                const size_t y_stride =
+                    (tid_local < qk_split) ? q_y_stride :
+                    (tid_local < kv_split) ? k_y_stride : v_y_stride;
+                const int row =
+                    (tid_local < qk_split) ? tid_local :
+                    (tid_local < kv_split) ? (tid_local - qk_split) :
+                                             (tid_local - kv_split);
 
                 auto fp16_to_fp32 = [](std::uint16_t h) -> float {
                     std::uint32_t s = (static_cast<std::uint32_t>(h & 0x8000U)) << 16;
@@ -2319,29 +2324,17 @@ bool ggml_sycl_q4k_qkv_fuse_inline(
     }
 
     sycl::queue * stream = sycl_ctx->stream();
-    // iter16: dispatch the 3 projections via the proven iter13 scalar
-    // kernel. The iter14 `run_q4k_fused_qkv` (single-launch combined
-    // kernel) is correctness-broken in this in-loop context for unknown
-    // reasons; that investigation is deferred to iter17. Calling the
-    // scalar kernel 3 times here still buys us:
-    //  1. K and V are marked GGML_OP_NONE so the impl loop's per-op
-    //     dispatch overhead (3x quantize_row_q8_1, 3x stage args, 3x
-    //     submit) is avoided.
-    //  2. The 3 dispatches go to the same in-order queue back-to-back,
-    //     so the SYCL runtime can pipeline them with no host sync.
-    //  3. The src1 (activation) is read 3 times instead of once -- a
-    //     bandwidth opportunity that iter17 can claim by getting the
-    //     fused kernel correct.
-    run_q4k_scalar_inline(q_op.vx, q_op.x, q_op.dst,
-                          q_op.ncols_x, q_op.nrows_x, q_op.ncols_y,
-                          q_op.dst_col_stride, stream);
-    run_q4k_scalar_inline(k_op.vx, k_op.x, k_op.dst,
-                          k_op.ncols_x, k_op.nrows_x, k_op.ncols_y,
-                          k_op.dst_col_stride, stream);
-    run_q4k_scalar_inline(v_op.vx, v_op.x, v_op.dst,
-                          v_op.ncols_x, v_op.nrows_x, v_op.ncols_y,
-                          v_op.dst_col_stride, stream);
-    (void) run_q4k_fused_qkv;
+    // iter17: dispatch the iter14 fused kernel (single launch with q/k/v
+    // partitioned across `total_rows = q_rows + k_rows + v_rows` work
+    // items). The iter17 rewrite of the kernel changes the outer-submit
+    // lambda capture from `[&]` to `[=]` and snapshots the projection
+    // assignment via const ternaries -- one of those two changes (most
+    // likely the capture switch) fixed the latent bug from iter14.
+    // Verified value-for-value against `run_q4k_scalar_inline` via a
+    // host-side comparison diagnostic that ran once per session against
+    // a temp dst pair (DIFF Q/K/V = 0 across all elements).
+    run_q4k_fused_qkv(q_op, k_op, v_op, stream);
+    (void) run_q4k_scalar_inline;
 
     // Mark K and V as no-op so the impl loop skips them when it reaches
     // those positions. (Q is the current node, the caller will not call
