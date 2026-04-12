@@ -1,5 +1,6 @@
 #include "mmvq.hpp"
 #include "ggml-backend-impl.h"
+#include "esimd_q4k_fused.hpp"
 
 #include "ggml.h"
 #include "ggml-quants.h"
@@ -2324,16 +2325,63 @@ bool ggml_sycl_q4k_qkv_fuse_inline(
     }
 
     sycl::queue * stream = sycl_ctx->stream();
-    // iter17: dispatch the iter14 fused kernel (single launch with q/k/v
-    // partitioned across `total_rows = q_rows + k_rows + v_rows` work
-    // items). The iter17 rewrite of the kernel changes the outer-submit
-    // lambda capture from `[&]` to `[=]` and snapshots the projection
-    // assignment via const ternaries -- one of those two changes (most
-    // likely the capture switch) fixed the latent bug from iter14.
-    // Verified value-for-value against `run_q4k_scalar_inline` via a
-    // host-side comparison diagnostic that ran once per session against
-    // a temp dst pair (DIFF Q/K/V = 0 across all elements).
-    run_q4k_fused_qkv(q_op, k_op, v_op, stream);
+
+    // iter18: ESIMD Q4K fused kernel ported from the gemma4-ipex
+    // cleanroom (`src/esimd/linear_forward_q4k_fused_sycl.cpp`).
+    // Two code paths in tree:
+    //
+    //   * default (iter17 plain SYCL fused) — `run_q4k_fused_qkv`
+    //     One kernel launch handles all three projections via thread
+    //     partition. ~4 % below baseline at -npl 8 on Gemma 4 31B.
+    //
+    //   * opt-in ESIMD via `GGML_SYCL_DEBUG_ESIMD_Q4K=1` —
+    //     `ggml_sycl_esimd_q4k_fused_dispatch` × 3 with a per-
+    //     (device, src0_aos) lazy SoA cache. Correct but on this
+    //     Arc/Level-Zero/DPC++ stack runs roughly within measurement
+    //     noise of the plain SYCL kernel (the cleanroom doc's
+    //     "block_load<128> is 6.5x faster than 4× block_load<32>"
+    //     claim doesn't translate to a measurable end-to-end win
+    //     here — see iter18 entry in ITERATION_LOG.md).
+    //
+    // The ESIMD path is kept in tree as dormant infrastructure and
+    // as the foundation for iter19's FFN-block fusion which will
+    // need the same SoA cache + ESIMD dispatch wiring.
+    static const bool s_esimd_enable =
+        std::getenv("GGML_SYCL_DEBUG_ESIMD_Q4K") != nullptr;
+
+    bool dispatched = false;
+    if (s_esimd_enable) {
+        auto dispatch_one_esimd = [&](const PendingQ4K & op) -> bool {
+            const int n_blocks_per_row = op.ncols_x / 256;
+            const std::size_t total_blocks =
+                static_cast<std::size_t>(op.nrows_x) *
+                static_cast<std::size_t>(n_blocks_per_row);
+            const std::uint8_t * payload = nullptr;
+            const std::uint8_t * meta    = nullptr;
+            if (!ggml_sycl_esimd_q4k_get_or_build_soa(
+                    *stream, device, op.vx, total_blocks, &payload, &meta)) {
+                return false;
+            }
+            ggml_sycl_esimd_q4k_fused_args fused{};
+            fused.payload          = payload;
+            fused.meta             = meta;
+            fused.n_blocks_per_row = n_blocks_per_row;
+            fused.x                = op.x;
+            fused.y                = op.dst;
+            fused.n_rows           = op.nrows_x;
+            fused.n_cols           = op.ncols_y;
+            fused.x_col_stride     = static_cast<std::size_t>(op.ncols_x);
+            fused.y_col_stride     = op.dst_col_stride;
+            ggml_sycl_esimd_q4k_fused_dispatch(*stream, fused);
+            return true;
+        };
+        dispatched = dispatch_one_esimd(q_op) &&
+                     dispatch_one_esimd(k_op) &&
+                     dispatch_one_esimd(v_op);
+    }
+    if (!dispatched) {
+        run_q4k_fused_qkv(q_op, k_op, v_op, stream);
+    }
     (void) run_q4k_scalar_inline;
 
     // Mark K and V as no-op so the impl loop skips them when it reaches
