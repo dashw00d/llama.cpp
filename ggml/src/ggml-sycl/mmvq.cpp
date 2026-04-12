@@ -510,6 +510,187 @@ void ggml_sycl_debug_compare_q4k_esimd_f32(
     sycl::free(esimd_dev, *stream);
 }
 
+/* gemma4-ipex iter6: live-write variant of the scratch ESIMD compare.
+   Same kernel as ggml_sycl_debug_compare_q4k_esimd_f32, but:
+     - processes every row_diff row (not min(nrows_x, 32))
+     - writes directly into dst_dd_i, overwriting stock's output
+     - runs on every matching call (no one-shot latch), because a
+       partial overwrite would mix ESIMD rows with stock rows
+   Gated on GGML_SYCL_DEBUG_Q4K_ESIMD_LIVE + the same narrow shape gate
+   (ncols_y == 8 && ncols_x == 5376) for the first correctness test. */
+bool ggml_sycl_debug_q4k_esimd_live_enabled() {
+    static const bool enabled = std::getenv("GGML_SYCL_DEBUG_Q4K_ESIMD_LIVE") != nullptr;
+    return enabled;
+}
+
+bool ggml_sycl_debug_q4k_esimd_live_should_run(int ncols_x, int nrows_x, int ncols_y) {
+    if (!ggml_sycl_debug_q4k_esimd_live_enabled()) {
+        return false;
+    }
+    if (ncols_y != 8 || ncols_x != 5376 || nrows_x <= 0) {
+        return false;
+    }
+    return true;
+}
+
+void ggml_sycl_debug_q4k_esimd_live(
+    const void * vx,
+    const float * x,
+    float * dst,
+    int device,
+    int ncols_x,
+    int row_low,
+    int nrows_x,
+    int ncols_y,
+    size_t dst_col_stride,
+    dpct::queue_ptr stream) {
+    if (!ggml_sycl_debug_q4k_esimd_live_should_run(ncols_x, nrows_x, ncols_y)) {
+        return;
+    }
+
+    {
+        static bool announced[GGML_SYCL_MAX_DEVICES] = {};
+        if (device >= 0 && device < GGML_SYCL_MAX_DEVICES && !announced[device]) {
+            announced[device] = true;
+            GGML_LOG_INFO(
+                "Q4_K ESIMD LIVE active: device=%d ncols_x=%d nrows_x=%d ncols_y=%d dst_stride=%zu row_low=%d\n",
+                device, ncols_x, nrows_x, ncols_y, dst_col_stride, row_low);
+        }
+    }
+
+    const int n_blocks_per_row = ncols_x / QK_K;
+    const int total_blocks = nrows_x * n_blocks_per_row;
+
+    std::vector<block_q4_K> vx_host(static_cast<size_t>(total_blocks));
+    std::vector<std::uint8_t> payload_host(static_cast<size_t>(total_blocks) * 128);
+    std::vector<std::uint8_t> meta_host(static_cast<size_t>(total_blocks) * 16);
+
+    SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(
+        vx_host.data(),
+        vx,
+        vx_host.size() * sizeof(block_q4_K)).wait()));
+
+    for (int block_idx = 0; block_idx < total_blocks; ++block_idx) {
+        const block_q4_K & block = vx_host[block_idx];
+        std::memcpy(payload_host.data() + static_cast<size_t>(block_idx) * 128, block.qs, 128);
+        std::memcpy(meta_host.data() + static_cast<size_t>(block_idx) * 16, &block, 16);
+    }
+
+    auto * payload_dev = static_cast<std::uint8_t *>(sycl::malloc_device(payload_host.size(), *stream));
+    auto * meta_dev = static_cast<std::uint8_t *>(sycl::malloc_device(meta_host.size(), *stream));
+    GGML_ASSERT(payload_dev != nullptr);
+    GGML_ASSERT(meta_dev != nullptr);
+
+    SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(payload_dev, payload_host.data(), payload_host.size()).wait()));
+    SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(meta_dev, meta_host.data(), meta_host.size()).wait()));
+
+    stream->submit([&](sycl::handler & cgh) {
+        const auto payload_base = payload_dev;
+        const auto meta_base = meta_dev;
+        const auto x_base = x;
+        float * const y_base = dst;
+        const auto nbpr = n_blocks_per_row;
+        const auto nr = nrows_x;
+        const auto nc = ncols_y;
+        const auto x_stride = static_cast<size_t>(ncols_x);
+        const auto y_stride = dst_col_stride;
+
+        cgh.parallel_for(
+            sycl::range<1>(static_cast<size_t>(nrows_x)),
+            [=](sycl::id<1> row_id) SYCL_ESIMD_KERNEL {
+                const int row = static_cast<int>(row_id[0]);
+                if (row >= nr) {
+                    return;
+                }
+
+                float acc[8] = {};
+
+                for (int ib = 0; ib < nbpr; ++ib) {
+                    const std::size_t block_idx =
+                        static_cast<std::size_t>(row) * static_cast<std::size_t>(nbpr) +
+                        static_cast<std::size_t>(ib);
+                    const std::uint8_t * payload = payload_base + block_idx * 128;
+                    const std::uint8_t * meta_ptr = meta_base + block_idx * 16;
+
+                    const float scale_base = ggml_sycl_debug_q4k_fp16_to_float(
+                        static_cast<std::uint16_t>(meta_ptr[0] | (meta_ptr[1] << 8)));
+                    const float neg_min_base = -ggml_sycl_debug_q4k_fp16_to_float(
+                        static_cast<std::uint16_t>(meta_ptr[2] | (meta_ptr[3] << 8)));
+
+                    float scales[8];
+                    float biases[8];
+                    for (int i = 0; i < 4; ++i) {
+                        const std::uint8_t a = meta_ptr[4 + i];
+                        const std::uint8_t b = meta_ptr[8 + i];
+                        const std::uint8_t c = meta_ptr[12 + i];
+                        const std::uint8_t scale0 = static_cast<std::uint8_t>(a & 0x3fU);
+                        const std::uint8_t scale1 = static_cast<std::uint8_t>((c & 0x0fU) | ((a >> 2) & 0x30U));
+                        const std::uint8_t min0 = static_cast<std::uint8_t>(b & 0x3fU);
+                        const std::uint8_t min1 = static_cast<std::uint8_t>((c >> 4) | ((b >> 2) & 0x30U));
+                        scales[i] = scale_base * static_cast<float>(scale0);
+                        scales[i + 4] = scale_base * static_cast<float>(scale1);
+                        biases[i] = neg_min_base * static_cast<float>(min0);
+                        biases[i + 4] = neg_min_base * static_cast<float>(min1);
+                    }
+
+                    esimd::simd<std::uint32_t, 128> full_block =
+                        esimd::convert<std::uint32_t>(
+                            esimd::block_load<std::uint8_t, 128>(
+                                const_cast<std::uint8_t *>(payload)));
+
+                    for (int pair = 0; pair < 4; ++pair) {
+                        const int low_group = pair * 2;
+                        const int high_group = low_group + 1;
+                        const float low_scale = scales[low_group];
+                        const float high_scale = scales[high_group];
+                        const float low_bias = biases[low_group];
+                        const float high_bias = biases[high_group];
+
+                        esimd::simd<std::uint32_t, 32> packed_u32 =
+                            full_block.template select<32, 1>(pair * 32);
+
+                        esimd::simd<float, 32> w_lo =
+                            esimd::convert<float>(packed_u32 & 0x0fU) * low_scale + low_bias;
+                        esimd::simd<float, 32> w_hi =
+                            esimd::convert<float>(packed_u32 >> 4) * high_scale + high_bias;
+
+                        const std::size_t x_lo_off = static_cast<std::size_t>(ib) * 256 + low_group * 32;
+                        const std::size_t x_hi_off = static_cast<std::size_t>(ib) * 256 + high_group * 32;
+
+                        esimd::simd<float, 16> wl0 = w_lo.template select<16, 1>(0);
+                        esimd::simd<float, 16> wl1 = w_lo.template select<16, 1>(16);
+                        esimd::simd<float, 16> wh0 = w_hi.template select<16, 1>(0);
+                        esimd::simd<float, 16> wh1 = w_hi.template select<16, 1>(16);
+
+                        for (int c = 0; c < nc; ++c) {
+                            const float * xc = x_base + c * x_stride;
+
+                            esimd::simd<float, 16> x_lo_0 =
+                                esimd::block_load<float, 16>(const_cast<float *>(xc + x_lo_off));
+                            esimd::simd<float, 16> x_lo_1 =
+                                esimd::block_load<float, 16>(const_cast<float *>(xc + x_lo_off + 16));
+                            esimd::simd<float, 16> x_hi_0 =
+                                esimd::block_load<float, 16>(const_cast<float *>(xc + x_hi_off));
+                            esimd::simd<float, 16> x_hi_1 =
+                                esimd::block_load<float, 16>(const_cast<float *>(xc + x_hi_off + 16));
+
+                            acc[c] += esimd::reduce<float>(wl0 * x_lo_0 + wl1 * x_lo_1, std::plus<>());
+                            acc[c] += esimd::reduce<float>(wh0 * x_hi_0 + wh1 * x_hi_1, std::plus<>());
+                        }
+                    }
+                }
+
+                for (int c = 0; c < nc; ++c) {
+                    y_base[c * y_stride + row] = acc[c];
+                }
+            });
+    });
+    stream->wait();
+
+    sycl::free(payload_dev, *stream);
+    sycl::free(meta_dev, *stream);
+}
+
 } // namespace
 
 template <typename reorder_vec_dot_q_sycl>
@@ -1712,6 +1893,17 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
             static_cast<size_t>(dst->ne[0]),
             stream);
         ggml_sycl_debug_compare_q4k_esimd_f32(
+            src0_dd_i,
+            src1_ddf_i,
+            dst_dd_i,
+            id,
+            static_cast<int>(ne00),
+            static_cast<int>(row_low),
+            static_cast<int>(row_diff),
+            static_cast<int>(src1_ncols),
+            static_cast<size_t>(dst->ne[0]),
+            stream);
+        ggml_sycl_debug_q4k_esimd_live(
             src0_dd_i,
             src1_ddf_i,
             dst_dd_i,
