@@ -198,7 +198,7 @@ void ggml_sycl_esimd_q4k_fused_dispatch(
                 const int row = static_cast<int>(row_id[0]);
                 if (row >= nr) return;
 
-                float acc[8] = {};
+                float acc[32] = {};  // iter22: widened from [8] to allow ncols_y up to 32 (npl 32)
 
                 for (int ib = 0; ib < nbpr; ++ib) {
                     const std::size_t block_idx =

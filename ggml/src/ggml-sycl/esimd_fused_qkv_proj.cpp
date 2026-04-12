@@ -162,7 +162,7 @@ void ggml_sycl_esimd_fused_qkv_dispatch(
             sycl::range<1>(static_cast<std::size_t>(total_rows)),
             [=](sycl::id<1> tid) SYCL_ESIMD_KERNEL {
                 const int t = static_cast<int>(tid[0]);
-                float acc[8] = {};
+                float acc[32] = {};  // iter22: widened from [8] to allow ncols_y up to 32 (npl 32)
 
                 if (t < a.q_n_rows) {
                     qkv_q4k_row_dot(

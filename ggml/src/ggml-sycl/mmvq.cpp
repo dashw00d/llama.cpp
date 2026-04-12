@@ -370,7 +370,7 @@ void ggml_sycl_debug_compare_q4k_esimd_f32(
                     return;
                 }
 
-                float acc[8] = {};
+                float acc[32] = {};  // iter22: widened from [8] for npl <= 32
 
                 for (int ib = 0; ib < nbpr; ++ib) {
                     const std::size_t block_idx =
@@ -1193,7 +1193,7 @@ void ggml_sycl_debug_q4k_esimd_live(
                     return;
                 }
 
-                float acc[8] = {};
+                float acc[32] = {};  // iter22: widened from [8] for npl <= 32
 
                 for (int ib = 0; ib < nbpr; ++ib) {
                     const std::size_t block_idx =
@@ -1713,7 +1713,7 @@ void run_q4k_scalar_cooperative(
                     return sycl::bit_cast<float>(s | ((e + 112U) << 23) | (m << 13));
                 };
 
-                float acc[8] = {};
+                float acc[32] = {};  // iter22: widened from [8] for npl <= 32
                 // Strided block loop: each of SG threads handles a
                 // disjoint subset of the n_blocks_per_row blocks.
                 for (int ib = lid; ib < n_blocks_per_row_local; ib += SG) {
@@ -1821,7 +1821,7 @@ void run_q4k_scalar_inline(
                     }
                     return sycl::bit_cast<float>(s | ((e + 112U) << 23) | (m << 13));
                 };
-                float acc[8] = {};
+                float acc[32] = {};  // iter22: widened from [8] for npl <= 32
                 for (int ib = 0; ib < n_blocks_per_row_local; ++ib) {
                     const block_q4_K & block =
                         vx_blocks[static_cast<std::size_t>(row) * n_blocks_per_row_local + ib];
@@ -1991,7 +1991,7 @@ void run_q4k_fused_qkv(
                     return sycl::bit_cast<float>(s | ((e + 112U) << 23) | (m << 13));
                 };
 
-                float acc[8] = {};
+                float acc[32] = {};  // iter22: widened from [8] for npl <= 32
                 for (int ib = 0; ib < n_blocks_per_row; ++ib) {
                     const block_q4_K & block =
                         blocks[static_cast<std::size_t>(row) * n_blocks_per_row + ib];
@@ -2305,7 +2305,10 @@ bool ggml_sycl_q4k_qkv_fuse_inline(
 
     const int ncols_x = static_cast<int>(nq->src[0]->ne[0]);
     const int ncols_y = static_cast<int>(nq->src[1]->ne[1]);
-    if (ncols_y != 8) return false;
+    // iter22: widened from ncols_y == 8 to [4, 32] so the gate fires
+    // for the iter22 batch-scaling bench (-npl 8/16/32). The fused
+    // kernels were updated to acc[32] in the same iter22 commit.
+    if (ncols_y < 4 || ncols_y > 32) return false;
     if (ncols_x != 5376) return false;
 
     PendingQ4K q_op = make_pending_from_tensor(nq);
@@ -2539,7 +2542,8 @@ bool ggml_sycl_q4k_mlp_fuse_inline(
     const int ncols_x = static_cast<int>(ngate->src[0]->ne[0]);
     const int nrows_x = static_cast<int>(ngate->src[0]->ne[1]);
     const int ncols_y = static_cast<int>(ngate->src[1]->ne[1]);
-    if (ncols_y != 8) { s_stage_ncols_fail++; trace_dump("ncols", i); return false; }
+    // iter22: widened from ncols_y == 8 to [4, 32] (acc[32] in kernel).
+    if (ncols_y < 4 || ncols_y > 32) { s_stage_ncols_fail++; trace_dump("ncols", i); return false; }
     if ((ncols_x % 256) != 0) { s_stage_ncols_fail++; return false; }
     if (nrows_x <= 0) { s_stage_ncols_fail++; return false; }
     s_stage_have_pair++;
@@ -2987,7 +2991,7 @@ void ggml_sycl_debug_q4k_xmx_fp16_scalar_live_OLD_INLINE(
                     }
                     return sycl::bit_cast<float>(s | ((e + 112U) << 23) | (m << 13));
                 };
-                float acc[8] = {};
+                float acc[32] = {};  // iter22: widened from [8] for npl <= 32
                 for (int ib = 0; ib < n_blocks_per_row_local; ++ib) {
                     const block_q4_K & block =
                         vx_blocks[static_cast<std::size_t>(row) * n_blocks_per_row_local + ib];
