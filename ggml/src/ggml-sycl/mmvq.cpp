@@ -6,6 +6,7 @@
 #include "vecdotq.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -567,6 +568,183 @@ struct ggml_sycl_q4k_esimd_live_arena_device {
 
 static ggml_sycl_q4k_esimd_live_arena_device g_q4k_esimd_live_arena[GGML_SYCL_MAX_DEVICES];
 
+/* gemma4-ipex iter9: env-gated per-call timing for the live Q4_K path.
+
+   Enabled by GGML_SYCL_DEBUG_Q4K_ESIMD_LIVE_TIMING=1 (on top of LIVE=1).
+   When enabled:
+     - ggml_sycl_debug_q4k_esimd_live wraps its ESIMD submit in a
+       stream->wait() sandwich and records wall-clock time per call
+     - ggml_sycl_debug_q4k_esimd_live_cache_lookup records wall-clock
+       time per cache fill (miss path only)
+     - a static destructor prints a per-device summary at program exit
+
+   The wait() sandwich deliberately undoes iter8's async optimisation
+   for the timing run, so per-call numbers are comparable to stock's
+   serial dispatch model. The production (timing-off) path is
+   unchanged and async. */
+
+struct ggml_sycl_q4k_esimd_live_timing_stats {
+    std::uint64_t kernel_count = 0;
+    double        kernel_total_ns = 0.0;
+    double        kernel_min_ns = 1e18;
+    double        kernel_max_ns = 0.0;
+    std::uint64_t fill_count = 0;
+    double        fill_total_ns = 0.0;
+    double        fill_min_ns = 1e18;
+    double        fill_max_ns = 0.0;
+};
+
+static ggml_sycl_q4k_esimd_live_timing_stats g_q4k_esimd_live_timing[GGML_SYCL_MAX_DEVICES];
+
+bool ggml_sycl_debug_q4k_esimd_live_timing_enabled() {
+    static const bool enabled = std::getenv("GGML_SYCL_DEBUG_Q4K_ESIMD_LIVE_TIMING") != nullptr;
+    return enabled;
+}
+
+void ggml_sycl_debug_q4k_esimd_live_timing_record_kernel(int device, double ns) {
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    auto & s = g_q4k_esimd_live_timing[device];
+    s.kernel_count++;
+    s.kernel_total_ns += ns;
+    if (ns < s.kernel_min_ns) s.kernel_min_ns = ns;
+    if (ns > s.kernel_max_ns) s.kernel_max_ns = ns;
+    if (s.kernel_count % 200 == 0) {
+        GGML_LOG_INFO(
+            "Q4_K ESIMD LIVE kernel timing: device=%d count=%llu avg=%.3f ms min=%.3f max=%.3f total=%.2f s\n",
+            device,
+            (unsigned long long) s.kernel_count,
+            s.kernel_total_ns / (double) s.kernel_count / 1e6,
+            s.kernel_min_ns / 1e6,
+            s.kernel_max_ns / 1e6,
+            s.kernel_total_ns / 1e9);
+    }
+}
+
+void ggml_sycl_debug_q4k_esimd_live_timing_record_fill(int device, double ns) {
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    auto & s = g_q4k_esimd_live_timing[device];
+    s.fill_count++;
+    s.fill_total_ns += ns;
+    if (ns < s.fill_min_ns) s.fill_min_ns = ns;
+    if (ns > s.fill_max_ns) s.fill_max_ns = ns;
+    GGML_LOG_INFO(
+        "Q4_K ESIMD LIVE fill timing: device=%d count=%llu this=%.2f ms avg=%.2f min=%.2f max=%.2f total=%.2f s\n",
+        device,
+        (unsigned long long) s.fill_count,
+        ns / 1e6,
+        s.fill_total_ns / (double) s.fill_count / 1e6,
+        s.fill_min_ns / 1e6,
+        s.fill_max_ns / 1e6,
+        s.fill_total_ns / 1e9);
+}
+
+struct ggml_sycl_q4k_esimd_live_timing_summary_printer {
+    ~ggml_sycl_q4k_esimd_live_timing_summary_printer() {
+        for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+            const auto & s = g_q4k_esimd_live_timing[d];
+            if (s.kernel_count == 0 && s.fill_count == 0) {
+                continue;
+            }
+            GGML_LOG_INFO(
+                "Q4_K ESIMD LIVE timing SUMMARY device=%d: "
+                "kernel count=%llu avg=%.3f ms min=%.3f max=%.3f total=%.2f s | "
+                "fill count=%llu avg=%.2f ms min=%.2f max=%.2f total=%.2f s\n",
+                d,
+                (unsigned long long) s.kernel_count,
+                s.kernel_count ? s.kernel_total_ns / (double) s.kernel_count / 1e6 : 0.0,
+                s.kernel_count ? s.kernel_min_ns / 1e6 : 0.0,
+                s.kernel_max_ns / 1e6,
+                s.kernel_total_ns / 1e9,
+                (unsigned long long) s.fill_count,
+                s.fill_count ? s.fill_total_ns / (double) s.fill_count / 1e6 : 0.0,
+                s.fill_count ? s.fill_min_ns / 1e6 : 0.0,
+                s.fill_max_ns / 1e6,
+                s.fill_total_ns / 1e9);
+        }
+    }
+};
+
+static ggml_sycl_q4k_esimd_live_timing_summary_printer g_q4k_esimd_live_timing_summary_printer;
+
+/* gemma4-ipex iter9: parallel timing for stock Q4_K MMVQ on the same shape.
+
+   Enabled by GGML_SYCL_DEBUG_Q4K_STOCK_TIMING=1. When set, the Q4_K case in
+   ggml_sycl_op_mul_mat_vec_q wraps the stock mul_mat_vec_q4_K_q8_1_sycl
+   (or its reordered cousin) with the same steady_clock + wait() timer and
+   records stats per device. Compare against the live kernel's own
+   per-call numbers on the same gated shape. Run with LIVE unset so stock
+   actually runs (the iter8 skip only fires when LIVE is set). */
+
+struct ggml_sycl_q4k_stock_timing_stats {
+    std::uint64_t count = 0;
+    double        total_ns = 0.0;
+    double        min_ns = 1e18;
+    double        max_ns = 0.0;
+};
+
+static ggml_sycl_q4k_stock_timing_stats g_q4k_stock_timing[GGML_SYCL_MAX_DEVICES];
+
+bool ggml_sycl_debug_q4k_stock_timing_enabled() {
+    static const bool enabled = std::getenv("GGML_SYCL_DEBUG_Q4K_STOCK_TIMING") != nullptr;
+    return enabled;
+}
+
+bool ggml_sycl_debug_q4k_stock_timing_should_run(int ncols_x, int nrows_x, int ncols_y) {
+    if (!ggml_sycl_debug_q4k_stock_timing_enabled()) {
+        return false;
+    }
+    if (ncols_y != 8 || ncols_x != 5376 || nrows_x <= 0) {
+        return false;
+    }
+    return true;
+}
+
+void ggml_sycl_debug_q4k_stock_timing_record(int device, double ns) {
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    auto & s = g_q4k_stock_timing[device];
+    s.count++;
+    s.total_ns += ns;
+    if (ns < s.min_ns) s.min_ns = ns;
+    if (ns > s.max_ns) s.max_ns = ns;
+    if (s.count % 200 == 0) {
+        GGML_LOG_INFO(
+            "Q4_K STOCK MMVQ timing: device=%d count=%llu avg=%.3f ms min=%.3f max=%.3f total=%.2f s\n",
+            device,
+            (unsigned long long) s.count,
+            s.total_ns / (double) s.count / 1e6,
+            s.min_ns / 1e6,
+            s.max_ns / 1e6,
+            s.total_ns / 1e9);
+    }
+}
+
+struct ggml_sycl_q4k_stock_timing_summary_printer {
+    ~ggml_sycl_q4k_stock_timing_summary_printer() {
+        for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+            const auto & s = g_q4k_stock_timing[d];
+            if (s.count == 0) {
+                continue;
+            }
+            GGML_LOG_INFO(
+                "Q4_K STOCK MMVQ timing SUMMARY device=%d: count=%llu avg=%.3f ms min=%.3f max=%.3f total=%.2f s\n",
+                d,
+                (unsigned long long) s.count,
+                s.total_ns / (double) s.count / 1e6,
+                s.min_ns / 1e6,
+                s.max_ns / 1e6,
+                s.total_ns / 1e9);
+        }
+    }
+};
+
+static ggml_sycl_q4k_stock_timing_summary_printer g_q4k_stock_timing_summary_printer;
+
 const ggml_sycl_q4k_esimd_cached_split * ggml_sycl_debug_q4k_esimd_live_cache_lookup(
     const void * vx,
     int total_blocks,
@@ -592,6 +770,8 @@ const ggml_sycl_q4k_esimd_cached_split * ggml_sycl_debug_q4k_esimd_live_cache_lo
         sycl::free(it->second.meta_dev, *stream);
         cache.erase(it);
     }
+
+    const auto fill_t0 = std::chrono::steady_clock::now();
 
     std::vector<block_q4_K> vx_host(static_cast<size_t>(total_blocks));
     std::vector<std::uint8_t> payload_host(static_cast<size_t>(total_blocks) * 128);
@@ -620,11 +800,19 @@ const ggml_sycl_q4k_esimd_cached_split * ggml_sycl_debug_q4k_esimd_live_cache_lo
     auto [inserted_it, ok] = cache.emplace(vx, entry);
     (void) ok;
 
+    const auto fill_t1 = std::chrono::steady_clock::now();
+
     GGML_LOG_INFO(
         "Q4_K ESIMD LIVE cache fill: device=%d vx=%p total_blocks=%d payload_bytes=%zu meta_bytes=%zu cache_entries=%zu\n",
         device, vx, total_blocks,
         payload_host.size(), meta_host.size(),
         cache.size());
+
+    if (ggml_sycl_debug_q4k_esimd_live_timing_enabled()) {
+        ggml_sycl_debug_q4k_esimd_live_timing_record_fill(
+            device,
+            std::chrono::duration<double, std::nano>(fill_t1 - fill_t0).count());
+    }
 
     return &inserted_it->second;
 }
@@ -661,6 +849,11 @@ void ggml_sycl_debug_q4k_esimd_live(
     if (entry == nullptr) {
         return;
     }
+
+    const bool timing_enabled = ggml_sycl_debug_q4k_esimd_live_timing_enabled();
+    const auto kern_t0 = timing_enabled
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
 
     stream->submit([&](sycl::handler & cgh) {
         const auto payload_base = entry->payload_dev;
@@ -763,10 +956,22 @@ void ggml_sycl_debug_q4k_esimd_live(
                 }
             });
     });
-    // gemma4-ipex iter8: NO stream->wait() here. Stock dispatch runs the
-    // stream asynchronously -- the in-order SYCL queue serializes subsequent
-    // ops after this submit naturally. The host-side wait was one of the
-    // two sources of the remaining 4x gap after iter7.
+    // gemma4-ipex iter8: NO stream->wait() here in the production path.
+    // Stock dispatch runs the stream asynchronously -- the in-order SYCL
+    // queue serializes subsequent ops after this submit naturally. The
+    // host-side wait was one of the two sources of the remaining 4x gap
+    // after iter7.
+    //
+    // gemma4-ipex iter9: UNDER TIMING ENV, we force a stream->wait() so
+    // the chrono clock measures actual kernel completion, not just the
+    // submit/enqueue time. Production (timing-off) path is unchanged.
+    if (timing_enabled) {
+        stream->wait();
+        const auto kern_t1 = std::chrono::steady_clock::now();
+        ggml_sycl_debug_q4k_esimd_live_timing_record_kernel(
+            device,
+            std::chrono::duration<double, std::nano>(kern_t1 - kern_t0).count());
+    }
 
     // Cache owns payload_dev / meta_dev -- no per-call free.
 }
@@ -1902,7 +2107,7 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
             case GGML_TYPE_Q3_K:
                 mul_mat_vec_q3_K_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
                 break;
-            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q4_K: {
                 // gemma4-ipex iter8: skip stock MMVQ entirely when the ESIMD
                 // live path will overwrite the result on the gated shape.
                 // Avoids doing the same matmul twice on gated calls.
@@ -1913,6 +2118,16 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                     GGML_SYCL_DEBUG("Skipping stock Q4K MMVQ: ESIMD live path owns this shape\n");
                     break;
                 }
+                // gemma4-ipex iter9: optional stock timing on the gated shape
+                // (same criteria as live path). Run with LIVE env unset so
+                // stock actually executes.
+                const bool stock_timed = ggml_sycl_debug_q4k_stock_timing_should_run(
+                    static_cast<int>(ne00),
+                    static_cast<int>(row_diff),
+                    static_cast<int>(src1_ncols));
+                const auto stock_t0 = stock_timed
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point{};
                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
                     ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
                     GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q4_k_q8_1_sycl\n");
@@ -1921,7 +2136,15 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                     GGML_SYCL_DEBUG("Calling mul_mat_vec_q4_K_q8_1_sycl\n");
                     mul_mat_vec_q4_K_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
                 }
+                if (stock_timed) {
+                    stream->wait();
+                    const auto stock_t1 = std::chrono::steady_clock::now();
+                    ggml_sycl_debug_q4k_stock_timing_record(
+                        id,
+                        std::chrono::duration<double, std::nano>(stock_t1 - stock_t0).count());
+                }
                 break;
+            }
             case GGML_TYPE_Q5_K:
                 mul_mat_vec_q5_K_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
                 break;
