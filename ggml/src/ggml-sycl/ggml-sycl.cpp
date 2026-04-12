@@ -3290,6 +3290,11 @@ inline bool ggml_sycl_supports_reorder_dmmv(enum ggml_type type) {
 }
 
 inline bool ggml_sycl_supports_reorder_mmvq(enum ggml_type type) {
+    if (type == GGML_TYPE_Q4_K &&
+        (std::getenv("GGML_SYCL_DEBUG_Q4K_CPU_AOS") != nullptr ||
+         std::getenv("GGML_SYCL_DEBUG_Q4K_ESIMD_F32") != nullptr)) {
+        return false;
+    }
     switch (type) {
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
