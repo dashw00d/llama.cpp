@@ -11,6 +11,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <sycl/ext/intel/esimd.hpp>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -510,14 +511,35 @@ void ggml_sycl_debug_compare_q4k_esimd_f32(
     sycl::free(esimd_dev, *stream);
 }
 
-/* gemma4-ipex iter6: live-write variant of the scratch ESIMD compare.
-   Same kernel as ggml_sycl_debug_compare_q4k_esimd_f32, but:
-     - processes every row_diff row (not min(nrows_x, 32))
-     - writes directly into dst_dd_i, overwriting stock's output
-     - runs on every matching call (no one-shot latch), because a
-       partial overwrite would mix ESIMD rows with stock rows
-   Gated on GGML_SYCL_DEBUG_Q4K_ESIMD_LIVE + the same narrow shape gate
-   (ncols_y == 8 && ncols_x == 5376) for the first correctness test. */
+/* gemma4-ipex iter7: per-device cached split buffers for the live ESIMD Q4_K path.
+
+   Iter 5's scratch compare and iter 6's uncached live path proved the
+   cleanroom fused kernel is correct when fed its required payload[128]
+   + meta[16] split contract. Iter 6's -npl 8 collapse (7.34 -> 0.55
+   t/s) was pure per-call scratch overhead: host round-trip memcpy +
+   malloc_device + free on every matching call.
+
+   This iter7 rewrite removes that overhead by caching the split per
+   (device, vx) pair. First call on a given weight tensor pays the
+   full split + upload cost once; every subsequent call on the same
+   weight reuses the cached payload_dev / meta_dev and only runs the
+   kernel. Cache entries are invalidated when total_blocks changes
+   for the same vx (graph-shape change) and freed in place.
+
+   Still gated on GGML_SYCL_DEBUG_Q4K_ESIMD_LIVE with the narrow
+   5376x8 shape gate -- this is a diagnostic, not the production
+   Q4K dispatch.
+
+   NOTE: PROVEN-KERNEL-ARCHITECTURE.md / PORTING-GUIDE.md wording that
+   claims the kernel reads ggml AoS block_q4_K directly is WRONG. See
+   include/ipex_cleanroom/esimd/linear_forward_q4k_fused_sycl.hpp
+   (linear_forward_q4k_fused_args { payload[128/blk] + meta[16/blk] })
+   and src/esimd/linear_forward_q4k_fused_sycl.cpp:115 -- the kernel
+   indexes separate payload and meta contiguous buffers, not a 144-byte
+   AoS stride. Iter 4's AoS-direct port failed because block_load<128>
+   on a non-128-byte-aligned payload pointer inside a 144-byte AoS
+   stride reads garbage. The split is not optional. */
+
 bool ggml_sycl_debug_q4k_esimd_live_enabled() {
     static const bool enabled = std::getenv("GGML_SYCL_DEBUG_Q4K_ESIMD_LIVE") != nullptr;
     return enabled;
@@ -531,6 +553,80 @@ bool ggml_sycl_debug_q4k_esimd_live_should_run(int ncols_x, int nrows_x, int nco
         return false;
     }
     return true;
+}
+
+struct ggml_sycl_q4k_esimd_cached_split {
+    std::uint8_t * payload_dev;
+    std::uint8_t * meta_dev;
+    int total_blocks;
+};
+
+struct ggml_sycl_q4k_esimd_live_arena_device {
+    std::unordered_map<const void *, ggml_sycl_q4k_esimd_cached_split> cache;
+};
+
+static ggml_sycl_q4k_esimd_live_arena_device g_q4k_esimd_live_arena[GGML_SYCL_MAX_DEVICES];
+
+const ggml_sycl_q4k_esimd_cached_split * ggml_sycl_debug_q4k_esimd_live_cache_lookup(
+    const void * vx,
+    int total_blocks,
+    int device,
+    dpct::queue_ptr stream) {
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return nullptr;
+    }
+
+    auto & cache = g_q4k_esimd_live_arena[device].cache;
+    auto it = cache.find(vx);
+
+    if (it != cache.end() && it->second.total_blocks == total_blocks) {
+        return &it->second;
+    }
+
+    // Cache miss OR invalidation because total_blocks changed.
+    if (it != cache.end()) {
+        GGML_LOG_INFO(
+            "Q4_K ESIMD LIVE cache invalidation: device=%d vx=%p old_blocks=%d new_blocks=%d\n",
+            device, vx, it->second.total_blocks, total_blocks);
+        sycl::free(it->second.payload_dev, *stream);
+        sycl::free(it->second.meta_dev, *stream);
+        cache.erase(it);
+    }
+
+    std::vector<block_q4_K> vx_host(static_cast<size_t>(total_blocks));
+    std::vector<std::uint8_t> payload_host(static_cast<size_t>(total_blocks) * 128);
+    std::vector<std::uint8_t> meta_host(static_cast<size_t>(total_blocks) * 16);
+
+    SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(
+        vx_host.data(),
+        vx,
+        vx_host.size() * sizeof(block_q4_K)).wait()));
+
+    for (int i = 0; i < total_blocks; ++i) {
+        const block_q4_K & block = vx_host[i];
+        std::memcpy(payload_host.data() + static_cast<size_t>(i) * 128, block.qs, 128);
+        std::memcpy(meta_host.data() + static_cast<size_t>(i) * 16, &block, 16);
+    }
+
+    auto * payload_dev = static_cast<std::uint8_t *>(sycl::malloc_device(payload_host.size(), *stream));
+    auto * meta_dev = static_cast<std::uint8_t *>(sycl::malloc_device(meta_host.size(), *stream));
+    GGML_ASSERT(payload_dev != nullptr);
+    GGML_ASSERT(meta_dev != nullptr);
+
+    SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(payload_dev, payload_host.data(), payload_host.size()).wait()));
+    SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(meta_dev, meta_host.data(), meta_host.size()).wait()));
+
+    ggml_sycl_q4k_esimd_cached_split entry = { payload_dev, meta_dev, total_blocks };
+    auto [inserted_it, ok] = cache.emplace(vx, entry);
+    (void) ok;
+
+    GGML_LOG_INFO(
+        "Q4_K ESIMD LIVE cache fill: device=%d vx=%p total_blocks=%d payload_bytes=%zu meta_bytes=%zu cache_entries=%zu\n",
+        device, vx, total_blocks,
+        payload_host.size(), meta_host.size(),
+        cache.size());
+
+    return &inserted_it->second;
 }
 
 void ggml_sycl_debug_q4k_esimd_live(
@@ -553,7 +649,7 @@ void ggml_sycl_debug_q4k_esimd_live(
         if (device >= 0 && device < GGML_SYCL_MAX_DEVICES && !announced[device]) {
             announced[device] = true;
             GGML_LOG_INFO(
-                "Q4_K ESIMD LIVE active: device=%d ncols_x=%d nrows_x=%d ncols_y=%d dst_stride=%zu row_low=%d\n",
+                "Q4_K ESIMD LIVE (cached) active: device=%d ncols_x=%d nrows_x=%d ncols_y=%d dst_stride=%zu row_low=%d\n",
                 device, ncols_x, nrows_x, ncols_y, dst_col_stride, row_low);
         }
     }
@@ -561,32 +657,14 @@ void ggml_sycl_debug_q4k_esimd_live(
     const int n_blocks_per_row = ncols_x / QK_K;
     const int total_blocks = nrows_x * n_blocks_per_row;
 
-    std::vector<block_q4_K> vx_host(static_cast<size_t>(total_blocks));
-    std::vector<std::uint8_t> payload_host(static_cast<size_t>(total_blocks) * 128);
-    std::vector<std::uint8_t> meta_host(static_cast<size_t>(total_blocks) * 16);
-
-    SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(
-        vx_host.data(),
-        vx,
-        vx_host.size() * sizeof(block_q4_K)).wait()));
-
-    for (int block_idx = 0; block_idx < total_blocks; ++block_idx) {
-        const block_q4_K & block = vx_host[block_idx];
-        std::memcpy(payload_host.data() + static_cast<size_t>(block_idx) * 128, block.qs, 128);
-        std::memcpy(meta_host.data() + static_cast<size_t>(block_idx) * 16, &block, 16);
+    const auto * entry = ggml_sycl_debug_q4k_esimd_live_cache_lookup(vx, total_blocks, device, stream);
+    if (entry == nullptr) {
+        return;
     }
 
-    auto * payload_dev = static_cast<std::uint8_t *>(sycl::malloc_device(payload_host.size(), *stream));
-    auto * meta_dev = static_cast<std::uint8_t *>(sycl::malloc_device(meta_host.size(), *stream));
-    GGML_ASSERT(payload_dev != nullptr);
-    GGML_ASSERT(meta_dev != nullptr);
-
-    SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(payload_dev, payload_host.data(), payload_host.size()).wait()));
-    SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(meta_dev, meta_host.data(), meta_host.size()).wait()));
-
     stream->submit([&](sycl::handler & cgh) {
-        const auto payload_base = payload_dev;
-        const auto meta_base = meta_dev;
+        const auto payload_base = entry->payload_dev;
+        const auto meta_base = entry->meta_dev;
         const auto x_base = x;
         float * const y_base = dst;
         const auto nbpr = n_blocks_per_row;
@@ -687,8 +765,7 @@ void ggml_sycl_debug_q4k_esimd_live(
     });
     stream->wait();
 
-    sycl::free(payload_dev, *stream);
-    sycl::free(meta_dev, *stream);
+    // Cache owns payload_dev / meta_dev -- no per-call free.
 }
 
 } // namespace
