@@ -1,6 +1,8 @@
 #include "mmvq.hpp"
 #include "ggml-backend-impl.h"
 #include "esimd_q4k_fused.hpp"
+#include "esimd_fused_qkv_proj.hpp"
+#include "esimd_fused_mlp_gate_up.hpp"
 
 #include "ggml.h"
 #include "ggml-quants.h"
@@ -2326,46 +2328,84 @@ bool ggml_sycl_q4k_qkv_fuse_inline(
 
     sycl::queue * stream = sycl_ctx->stream();
 
-    // iter18: ESIMD Q4K fused kernel ported from the gemma4-ipex
-    // cleanroom (`src/esimd/linear_forward_q4k_fused_sycl.cpp`).
-    // Two code paths in tree:
+    // iter19: ESIMD true Q+K+V fusion (one launch for all 3 projections).
+    // Ported from gemma4-ipex/src/esimd/fused_qkv_proj.cpp.
+    // Each thread t in [0, q_rows + k_rows + v_rows) computes one output
+    // row and the t→(projection, row) mapping inside the kernel routes
+    // it to Q, K, or V. Activation x is shared across all threads.
     //
-    //   * default (iter17 plain SYCL fused) — `run_q4k_fused_qkv`
-    //     One kernel launch handles all three projections via thread
-    //     partition. ~4 % below baseline at -npl 8 on Gemma 4 31B.
-    //
-    //   * opt-in ESIMD via `GGML_SYCL_DEBUG_ESIMD_Q4K=1` —
-    //     `ggml_sycl_esimd_q4k_fused_dispatch` × 3 with a per-
-    //     (device, src0_aos) lazy SoA cache. Correct but on this
-    //     Arc/Level-Zero/DPC++ stack runs roughly within measurement
-    //     noise of the plain SYCL kernel (the cleanroom doc's
-    //     "block_load<128> is 6.5x faster than 4× block_load<32>"
-    //     claim doesn't translate to a measurable end-to-end win
-    //     here — see iter18 entry in ITERATION_LOG.md).
-    //
-    // The ESIMD path is kept in tree as dormant infrastructure and
-    // as the foundation for iter19's FFN-block fusion which will
-    // need the same SoA cache + ESIMD dispatch wiring.
-    static const bool s_esimd_enable =
-        std::getenv("GGML_SYCL_DEBUG_ESIMD_Q4K") != nullptr;
+    // Three code paths in tree (env-toggled):
+    //   default                                       : iter19 ESIMD fused_qkv_proj (1 launch)
+    //   GGML_SYCL_DEBUG_ESIMD_Q4K_PERPROJ             : iter18 ESIMD per-projection × 3 launches
+    //   GGML_SYCL_DEBUG_ESIMD_DISABLE                 : iter17 plain SYCL fused fallback
+    static const bool s_esimd_disable =
+        std::getenv("GGML_SYCL_DEBUG_ESIMD_DISABLE") != nullptr;
+    static const bool s_esimd_perproj =
+        std::getenv("GGML_SYCL_DEBUG_ESIMD_Q4K_PERPROJ") != nullptr;
+
+    auto build_soa = [&](const PendingQ4K & op,
+                         const std::uint8_t ** payload,
+                         const std::uint8_t ** meta) -> bool {
+        const int n_blocks_per_row = op.ncols_x / 256;
+        const std::size_t total_blocks =
+            static_cast<std::size_t>(op.nrows_x) *
+            static_cast<std::size_t>(n_blocks_per_row);
+        return ggml_sycl_esimd_q4k_get_or_build_soa(
+            *stream, device, op.vx, total_blocks, payload, meta);
+    };
 
     bool dispatched = false;
-    if (s_esimd_enable) {
+
+    if (!s_esimd_disable && !s_esimd_perproj) {
+        // iter19 default: true Q+K+V fusion in one kernel launch.
+        const std::uint8_t *q_payload = nullptr, *q_meta = nullptr;
+        const std::uint8_t *k_payload = nullptr, *k_meta = nullptr;
+        const std::uint8_t *v_payload = nullptr, *v_meta = nullptr;
+        if (build_soa(q_op, &q_payload, &q_meta) &&
+            build_soa(k_op, &k_payload, &k_meta) &&
+            build_soa(v_op, &v_payload, &v_meta)) {
+
+            ggml_sycl_esimd_fused_qkv_args fargs{};
+            fargs.q_payload      = q_payload;
+            fargs.q_meta         = q_meta;
+            fargs.q_nbpr         = q_op.ncols_x / 256;
+            fargs.q_n_rows       = q_op.nrows_x;
+            fargs.q_out          = q_op.dst;
+            fargs.q_y_col_stride = q_op.dst_col_stride;
+
+            fargs.k_payload      = k_payload;
+            fargs.k_meta         = k_meta;
+            fargs.k_nbpr         = k_op.ncols_x / 256;
+            fargs.k_n_rows       = k_op.nrows_x;
+            fargs.k_out          = k_op.dst;
+            fargs.k_y_col_stride = k_op.dst_col_stride;
+
+            fargs.v_raw_blocks   = v_payload;   // Q4K payload base
+            fargs.v_meta         = v_meta;
+            fargs.v_nbpr         = v_op.ncols_x / 256;
+            fargs.v_n_rows       = v_op.nrows_x;
+            fargs.v_out          = v_op.dst;
+            fargs.v_y_col_stride = v_op.dst_col_stride;
+            fargs.v_is_q4k       = true;
+
+            fargs.x              = q_op.x;  // shared across q/k/v
+            fargs.ne0            = q_op.ncols_x;
+            fargs.n_cols         = q_op.ncols_y;
+            fargs.x_col_stride   = static_cast<std::size_t>(q_op.ncols_x);
+
+            ggml_sycl_esimd_fused_qkv_dispatch(*stream, fargs);
+            dispatched = true;
+        }
+    } else if (s_esimd_perproj) {
+        // iter18 path: per-projection ESIMD × 3 (kept for A/B testing).
         auto dispatch_one_esimd = [&](const PendingQ4K & op) -> bool {
-            const int n_blocks_per_row = op.ncols_x / 256;
-            const std::size_t total_blocks =
-                static_cast<std::size_t>(op.nrows_x) *
-                static_cast<std::size_t>(n_blocks_per_row);
             const std::uint8_t * payload = nullptr;
             const std::uint8_t * meta    = nullptr;
-            if (!ggml_sycl_esimd_q4k_get_or_build_soa(
-                    *stream, device, op.vx, total_blocks, &payload, &meta)) {
-                return false;
-            }
+            if (!build_soa(op, &payload, &meta)) return false;
             ggml_sycl_esimd_q4k_fused_args fused{};
             fused.payload          = payload;
             fused.meta             = meta;
-            fused.n_blocks_per_row = n_blocks_per_row;
+            fused.n_blocks_per_row = op.ncols_x / 256;
             fused.x                = op.x;
             fused.y                = op.dst;
             fused.n_rows           = op.nrows_x;
@@ -2379,7 +2419,9 @@ bool ggml_sycl_q4k_qkv_fuse_inline(
                      dispatch_one_esimd(k_op) &&
                      dispatch_one_esimd(v_op);
     }
+
     if (!dispatched) {
+        // Fallback to iter17 plain SYCL fused.
         run_q4k_fused_qkv(q_op, k_op, v_op, stream);
     }
     (void) run_q4k_scalar_inline;
@@ -2393,6 +2435,206 @@ bool ggml_sycl_q4k_qkv_fuse_inline(
     }
     nk->op = GGML_OP_NONE;
     nv->op = GGML_OP_NONE;
+
+    return true;
+}
+
+// iter19 in-loop FFN gate+up fusion. Companion to ggml_sycl_q4k_qkv_fuse_inline.
+// Pattern: a Q4_K MUL_MAT (gate) followed by EXACTLY one more Q4_K MUL_MAT
+// (up) within the search window with src[1] tensor identity match, and NO
+// THIRD matching Q4_K MUL_MAT (which would be the QKV pattern handled
+// by the qkv helper). This distinguishes "FFN gate+up share src1" from
+// "QKV all share src1".
+//
+// On match dispatches the fused gate+up+silu+mul ESIMD kernel and marks
+// the up node, the silu node, and the mul node as GGML_OP_NONE so the
+// impl loop skips them. The DOWN matmul + residual add are NOT fused
+// here -- iter20 will extend this to full FFN-block fusion.
+bool ggml_sycl_q4k_mlp_fuse_inline(
+    ggml_backend_sycl_context * sycl_ctx,
+    ggml_cgraph *               cgraph,
+    int                         i,
+    SyclQ4KFusionRestoreList *  restore_list) {
+    if (!ggml_sycl_debug_q4k_qkv_fusion_enabled()) return false;
+    if (sycl_ctx == nullptr || cgraph == nullptr) return false;
+    if (i < 0 || i >= cgraph->n_nodes) return false;
+
+    ggml_tensor * ngate = cgraph->nodes[i];
+    if (ngate == nullptr || ngate->op != GGML_OP_MUL_MAT) return false;
+    if (ngate->src[0] == nullptr || ngate->src[1] == nullptr) return false;
+    if (ngate->src[0]->type != GGML_TYPE_Q4_K) return false;
+
+    const int device = sycl_ctx->device;
+    if (sycl_buffer_device(ngate->src[0]) != device) return false;
+    if (sycl_buffer_device(ngate->src[1]) != device) return false;
+    if (sycl_buffer_device(ngate) != device) return false;
+
+    ggml_tensor * src1_tensor = ngate->src[1];
+    if (src1_tensor == nullptr) return false;
+
+    // Find next 2 Q4_K MUL_MATs sharing src1 identity within window.
+    // For gate+up: exactly ONE match. For QKV: TWO matches.
+    int nup_idx = -1;
+    int third_idx = -1;
+    const int kSearchWindow = 16;
+    const int j_max = std::min(cgraph->n_nodes, i + 1 + kSearchWindow);
+    for (int j = i + 1; j < j_max; ++j) {
+        ggml_tensor * nj = cgraph->nodes[j];
+        if (nj == nullptr) continue;
+        if (nj->op != GGML_OP_MUL_MAT) continue;
+        if (nj->src[0] == nullptr || nj->src[1] == nullptr) continue;
+        if (nj->src[0]->type != GGML_TYPE_Q4_K) continue;
+        if (nj->src[1] != src1_tensor) continue;
+        if (nup_idx < 0) {
+            nup_idx = j;
+        } else {
+            third_idx = j;
+            break;
+        }
+    }
+    if (nup_idx < 0) return false;
+    if (third_idx >= 0) return false;  // QKV pattern, let the QKV helper handle it
+
+    ggml_tensor * nup = cgraph->nodes[nup_idx];
+
+    if (sycl_buffer_device(nup->src[0]) != device) return false;
+    if (sycl_buffer_device(nup) != device) return false;
+
+    // Same shape requirement as gate weights.
+    if (ngate->src[0]->ne[0] != nup->src[0]->ne[0]) return false;
+    if (ngate->src[0]->ne[1] != nup->src[0]->ne[1]) return false;
+    if (ngate->src[1]->ne[1] != nup->src[1]->ne[1]) return false;
+
+    const int ncols_x = static_cast<int>(ngate->src[0]->ne[0]);
+    const int nrows_x = static_cast<int>(ngate->src[0]->ne[1]);
+    const int ncols_y = static_cast<int>(ngate->src[1]->ne[1]);
+    if (ncols_y != 8) return false;
+    if ((ncols_x % 256) != 0) return false;
+    if (nrows_x <= 0) return false;
+
+    PendingQ4K gate_op = make_pending_from_tensor(ngate);
+    PendingQ4K up_op   = make_pending_from_tensor(nup);
+    if (gate_op.vx == nullptr || up_op.vx == nullptr) return false;
+    if (gate_op.dst == nullptr || up_op.dst == nullptr) return false;
+    if (gate_op.x == nullptr) return false;
+
+    sycl::queue * stream = sycl_ctx->stream();
+
+    const int n_blocks_per_row = ncols_x / 256;
+    const std::size_t total_blocks =
+        static_cast<std::size_t>(nrows_x) *
+        static_cast<std::size_t>(n_blocks_per_row);
+    const std::uint8_t *gate_payload = nullptr, *gate_meta = nullptr;
+    const std::uint8_t *up_payload   = nullptr, *up_meta   = nullptr;
+    if (!ggml_sycl_esimd_q4k_get_or_build_soa(
+            *stream, device, gate_op.vx, total_blocks, &gate_payload, &gate_meta)) return false;
+    if (!ggml_sycl_esimd_q4k_get_or_build_soa(
+            *stream, device, up_op.vx, total_blocks, &up_payload, &up_meta)) return false;
+
+    // The fused kernel writes silu(gate)*up directly to gate_op.dst.
+    // The original gate matmul output is overwritten -- but we then
+    // mark the up matmul AND any intervening silu/mul ops as
+    // GGML_OP_NONE, and the downstream consumer of the silu*mul output
+    // reads from one of those NONE'd nodes' dst -- which is the same
+    // pointer as gate_op.dst (since the nodes' lifetimes overlap and
+    // the allocator likely reuses the buffer). Wait: that's not safe
+    // in general. For iter19 we write the fused output to gate_op.dst
+    // AND set gate_op.dst as the source for the silu/mul replacement.
+    //
+    // SAFER approach: keep gate matmul running as-is, run fused kernel
+    // into a temp buffer, replace the silu*mul output with the fused
+    // result via dst data pointer aliasing... too invasive.
+    //
+    // For iter19 SIMPLEST correct approach: DON'T mark silu/mul as
+    // NONE. Just fuse the gate matmul + write fused result into the
+    // mul node's dst. The silu/mul ops will run normally on top of
+    // (incorrect) gate output but their output gets overwritten by us
+    // before downstream consumers read it... no, that races.
+    //
+    // CORRECT iter19: only fuse if we can find the mul node and write
+    // directly to its dst. Mark gate, up, silu, mul as NONE so none
+    // of them run. Find the mul node by scanning forward from up_idx
+    // for a MUL op whose src[0] or src[1] is the silu output.
+
+    // Find silu node and mul node downstream of up.
+    int silu_idx = -1, mul_idx = -1;
+    ggml_tensor * silu_node = nullptr;
+    ggml_tensor * mul_node  = nullptr;
+    for (int j = nup_idx + 1; j < std::min(cgraph->n_nodes, nup_idx + 1 + kSearchWindow); ++j) {
+        ggml_tensor * nj = cgraph->nodes[j];
+        if (nj == nullptr) continue;
+        if (silu_idx < 0 && nj->op == GGML_OP_UNARY) {
+            // Check if it's silu by looking at the unary op param.
+            // The silu op param is in nj->op_params; for SILU it's
+            // GGML_UNARY_OP_SILU == 9 (from ggml.h).
+            const int unary_op = ggml_get_unary_op(nj);
+            if (unary_op == GGML_UNARY_OP_SILU &&
+                nj->src[0] != nullptr && nj->src[0] == ngate) {
+                silu_idx = j;
+                silu_node = nj;
+            }
+            continue;
+        }
+        if (silu_idx >= 0 && mul_idx < 0 && nj->op == GGML_OP_MUL) {
+            // mul that uses silu_node and nup
+            const bool a = (nj->src[0] == silu_node && nj->src[1] == nup);
+            const bool b = (nj->src[1] == silu_node && nj->src[0] == nup);
+            if (a || b) {
+                mul_idx = j;
+                mul_node = nj;
+                break;
+            }
+        }
+    }
+    if (silu_idx < 0 || mul_idx < 0) return false;
+    if (mul_node == nullptr) return false;
+
+    // Sanity: mul output shape should match the gate matmul shape.
+    if (mul_node->ne[0] != ngate->ne[0] || mul_node->ne[1] != ngate->ne[1]) return false;
+    if (sycl_buffer_device(mul_node) != device) return false;
+
+    // Build args targeting mul_node->data so the fused output lands
+    // exactly where downstream ops expect to read it.
+    ggml_sycl_esimd_fused_mlp_gate_up_args fargs{};
+    fargs.gate_payload    = gate_payload;
+    fargs.gate_meta       = gate_meta;
+    fargs.up_payload      = up_payload;
+    fargs.up_meta         = up_meta;
+    fargs.n_blocks_per_row = n_blocks_per_row;
+    fargs.n_rows          = nrows_x;
+    fargs.x               = gate_op.x;
+    fargs.y               = static_cast<float *>(mul_node->data);
+    fargs.n_cols          = ncols_y;
+    fargs.x_col_stride    = static_cast<std::size_t>(ncols_x);
+    fargs.y_col_stride    = static_cast<std::size_t>(mul_node->nb[1] / sizeof(float));
+
+    static int s_mlp_count[GGML_SYCL_MAX_DEVICES] = {};
+    static int s_mlp_total = 0;
+    if (device >= 0 && device < GGML_SYCL_MAX_DEVICES) s_mlp_count[device]++;
+    s_mlp_total++;
+    if (s_mlp_total <= 5 || (s_mlp_total % 200) == 0) {
+        GGML_LOG_INFO("Q4_K MLP gate+up inline-fuse #%d device=%d nodes=%d,%d,%d,%d "
+                      "rows=%d ncols_x=%d ncols_y=%d (total dev0=%d dev1=%d dev2=%d)\n",
+                      s_mlp_total, device, i, nup_idx, silu_idx, mul_idx,
+                      nrows_x, ncols_x, ncols_y,
+                      s_mlp_count[0], s_mlp_count[1], s_mlp_count[2]);
+    }
+
+    ggml_sycl_esimd_fused_mlp_gate_up_dispatch(*stream, fargs);
+
+    // Mark gate, up, silu, mul as NONE. The fused kernel wrote into
+    // mul_node->data so any downstream consumer of that pointer sees
+    // the right values.
+    auto mark = [&](ggml_tensor * n) {
+        if (restore_list != nullptr) {
+            restore_list->push_back({n, static_cast<int>(n->op)});
+        }
+        n->op = GGML_OP_NONE;
+    };
+    mark(ngate);
+    mark(nup);
+    mark(silu_node);
+    mark(mul_node);
 
     return true;
 }

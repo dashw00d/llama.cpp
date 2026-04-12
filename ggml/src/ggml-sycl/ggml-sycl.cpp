@@ -4447,6 +4447,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
 
+        // iter19: FFN gate+up+silu+mul fusion. Same restore list,
+        // separate detection (gate+up share src1 but no third match,
+        // distinguishing from the QKV pattern handled above).
+        if (ggml_sycl_q4k_mlp_fuse_inline(sycl_ctx, cgraph, i, &qkv_fusion_restore)) {
+            continue;
+        }
+
         bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
         if (!ok) {
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));

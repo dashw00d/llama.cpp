@@ -58,4 +58,16 @@ bool ggml_sycl_q4k_qkv_fuse_inline(
     int                         i,
     SyclQ4KFusionRestoreList *  restore_list);
 
+// iter19: FFN gate+up+SiLU+mul fusion. Pattern: a Q4_K MUL_MAT (gate)
+// followed by exactly one more Q4_K MUL_MAT (up) sharing src[1], then
+// silu(gate), then mul(silu, up). Detected via tensor identity match.
+// On success dispatches the fused ESIMD kernel and marks gate/up/silu/
+// mul as GGML_OP_NONE so the impl loop skips them. Caller threads the
+// same restore list as for QKV fusion.
+bool ggml_sycl_q4k_mlp_fuse_inline(
+    ggml_backend_sycl_context * sycl_ctx,
+    ggml_cgraph *               cgraph,
+    int                         i,
+    SyclQ4KFusionRestoreList *  restore_list);
+
 #endif // GGML_SYCL_MMVQ_HPP
