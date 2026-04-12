@@ -4447,10 +4447,17 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
 
-        // iter19: FFN gate+up+silu+mul fusion. Same restore list,
-        // separate detection (gate+up share src1 but no third match,
-        // distinguishing from the QKV pattern handled above).
-        if (ggml_sycl_q4k_mlp_fuse_inline(sycl_ctx, cgraph, i, &qkv_fusion_restore)) {
+        // iter19/20: FFN gate+up+(silu|gelu)*mul fusion. Same restore
+        // list, separate detection. Default OFF because the 1-thread-
+        // per-row ESIMD kernel is 16x under-occupied vs stock's
+        // cooperative-warp Q4K MMVQ at the FFN shape (21504 rows x
+        // 16 threads/row in stock vs 21504 rows x 1 thread/row in our
+        // fused kernel) -- iter20 measured -40% TG. Set
+        // GGML_SYCL_DEBUG_Q4K_MLP_FUSION=1 to enable.
+        static const bool s_mlp_fusion_enable =
+            std::getenv("GGML_SYCL_DEBUG_Q4K_MLP_FUSION") != nullptr;
+        if (s_mlp_fusion_enable &&
+            ggml_sycl_q4k_mlp_fuse_inline(sycl_ctx, cgraph, i, &qkv_fusion_restore)) {
             continue;
         }
 

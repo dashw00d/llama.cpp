@@ -109,11 +109,27 @@ void ggml_sycl_esimd_fused_mlp_gate_up_dispatch(
                     a.up_payload, a.up_meta, a.n_blocks_per_row, row,
                     a.x, a.x_col_stride, a.n_cols, up_acc);
 
-                // Fused epilogue: silu(gate) * up — no intermediate write
+                // Fused epilogue: activation(gate) * up — no intermediate write.
+                // Activation is selected per-call via args.activation:
+                //   SILU : silu(g) = g / (1 + exp(-g))     [Qwen3, Llama3]
+                //   GELU : gelu_tanh(g) = 0.5*g*(1+tanh(sqrt(2/pi)*g*(1+0.044715*g*g)))  [Gemma]
+                // ESIMD context disallows sycl::tanh; implement via exp:
+                //   tanh(x) = 1 - 2 / (exp(2x) + 1)
+                // sycl::exp IS allowed in ESIMD (the silu path uses it).
+                const bool use_gelu = (a.activation == GGML_SYCL_ESIMD_MLP_GELU);
                 for (int c = 0; c < a.n_cols; ++c) {
-                    const float g      = gate_acc[c];
-                    const float silu_g = g / (1.0f + sycl::exp(-g));
-                    a.y[c * a.y_col_stride + row] = silu_g * up_acc[c];
+                    const float g = gate_acc[c];
+                    float act;
+                    if (use_gelu) {
+                        const float gg = g * g;
+                        // 0.79788456f = sqrt(2/pi); 0.044715f = GELU_COEF_A
+                        const float u = 0.79788456f * g * (1.0f + 0.044715f * gg);
+                        const float th = 1.0f - 2.0f / (sycl::exp(2.0f * u) + 1.0f);
+                        act = 0.5f * g * (1.0f + th);
+                    } else {
+                        act = g / (1.0f + sycl::exp(-g));
+                    }
+                    a.y[c * a.y_col_stride + row] = act * up_acc[c];
                 }
             });
     });

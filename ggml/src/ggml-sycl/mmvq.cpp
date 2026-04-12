@@ -2492,8 +2492,38 @@ bool ggml_sycl_q4k_mlp_fuse_inline(
             break;
         }
     }
-    if (nup_idx < 0) return false;
-    if (third_idx >= 0) return false;  // QKV pattern, let the QKV helper handle it
+    // Diagnostic counters (env-gated by GGML_SYCL_DEBUG_Q4K_MLP_TRACE).
+    // Each "stage_n" counter increments when we pass that early-return
+    // gate. Lets us see how far the detection gets before bailing.
+    static const bool s_mlp_trace =
+        std::getenv("GGML_SYCL_DEBUG_Q4K_MLP_TRACE") != nullptr;
+    static int s_stage_partner_search = 0;
+    static int s_stage_no_partner = 0;
+    static int s_stage_qkv_pattern = 0;
+    static int s_stage_shape_fail = 0;
+    static int s_stage_ncols_fail = 0;
+    static int s_stage_have_pair = 0;
+    static int s_stage_no_silu = 0;
+    static int s_stage_no_mul = 0;
+    static int s_stage_dispatched = 0;
+    auto trace_dump = [&](const char * tag, int idx) {
+        if (!s_mlp_trace) return;
+        static int s_emit = 0;
+        s_emit++;
+        if (s_emit < 50 || (s_emit % 200) == 0) {
+            GGML_LOG_INFO("MLP[%s] @node=%d dev=%d  partner_search=%d "
+                          "no_partner=%d qkv=%d shape_fail=%d ncols_fail=%d "
+                          "have_pair=%d no_silu=%d no_mul=%d dispatched=%d\n",
+                          tag, idx, device,
+                          s_stage_partner_search, s_stage_no_partner,
+                          s_stage_qkv_pattern, s_stage_shape_fail,
+                          s_stage_ncols_fail, s_stage_have_pair,
+                          s_stage_no_silu, s_stage_no_mul, s_stage_dispatched);
+        }
+    };
+    s_stage_partner_search++;
+    if (nup_idx < 0)   { s_stage_no_partner++;  trace_dump("no_partner", i); return false; }
+    if (third_idx >= 0){ s_stage_qkv_pattern++; return false; }  // QKV pattern, expected
 
     ggml_tensor * nup = cgraph->nodes[nup_idx];
 
@@ -2501,16 +2531,18 @@ bool ggml_sycl_q4k_mlp_fuse_inline(
     if (sycl_buffer_device(nup) != device) return false;
 
     // Same shape requirement as gate weights.
-    if (ngate->src[0]->ne[0] != nup->src[0]->ne[0]) return false;
-    if (ngate->src[0]->ne[1] != nup->src[0]->ne[1]) return false;
-    if (ngate->src[1]->ne[1] != nup->src[1]->ne[1]) return false;
+    if (ngate->src[0]->ne[0] != nup->src[0]->ne[0]) { s_stage_shape_fail++; trace_dump("shape", i); return false; }
+    if (ngate->src[0]->ne[1] != nup->src[0]->ne[1]) { s_stage_shape_fail++; trace_dump("shape", i); return false; }
+    if (ngate->src[1]->ne[1] != nup->src[1]->ne[1]) { s_stage_shape_fail++; trace_dump("shape", i); return false; }
 
     const int ncols_x = static_cast<int>(ngate->src[0]->ne[0]);
     const int nrows_x = static_cast<int>(ngate->src[0]->ne[1]);
     const int ncols_y = static_cast<int>(ngate->src[1]->ne[1]);
-    if (ncols_y != 8) return false;
-    if ((ncols_x % 256) != 0) return false;
-    if (nrows_x <= 0) return false;
+    if (ncols_y != 8) { s_stage_ncols_fail++; trace_dump("ncols", i); return false; }
+    if ((ncols_x % 256) != 0) { s_stage_ncols_fail++; return false; }
+    if (nrows_x <= 0) { s_stage_ncols_fail++; return false; }
+    s_stage_have_pair++;
+    trace_dump("have_pair", i);
 
     PendingQ4K gate_op = make_pending_from_tensor(ngate);
     PendingQ4K up_op   = make_pending_from_tensor(nup);
@@ -2556,38 +2588,76 @@ bool ggml_sycl_q4k_mlp_fuse_inline(
     // of them run. Find the mul node by scanning forward from up_idx
     // for a MUL op whose src[0] or src[1] is the silu output.
 
-    // Find silu node and mul node downstream of up.
-    int silu_idx = -1, mul_idx = -1;
-    ggml_tensor * silu_node = nullptr;
-    ggml_tensor * mul_node  = nullptr;
+    // iter20: modern ggml fuses SiLU + elementwise multiply into a
+    // single GGML_OP_GLU node with sub-op GGML_GLU_OP_SWIGLU. The GLU
+    // node has src[0] = gate matmul output, src[1] = up matmul output.
+    // There is no separate SILU + MUL pair anymore (the iter19 detection
+    // was looking for an op pattern that ggml replaced).
+    //
+    // Walk past view/reshape/permute when checking src[0] / src[1]
+    // ancestry against gate / up -- Gemma 4 may insert intermediates.
+    auto walk_through_views = [](const ggml_tensor * t) -> const ggml_tensor * {
+        const ggml_tensor * cur = t;
+        for (int hop = 0; hop < 8 && cur != nullptr; ++hop) {
+            if (cur->view_src != nullptr) { cur = cur->view_src; continue; }
+            switch (cur->op) {
+                case GGML_OP_RESHAPE:
+                case GGML_OP_VIEW:
+                case GGML_OP_PERMUTE:
+                case GGML_OP_TRANSPOSE:
+                case GGML_OP_CONT:
+                    if (cur->src[0] != nullptr) { cur = cur->src[0]; continue; }
+                    break;
+                default:
+                    return cur;
+            }
+            return cur;
+        }
+        return cur;
+    };
+
+    int glu_idx = -1;
+    ggml_tensor * glu_node = nullptr;
+    int glu_sub_op_found = -1;
+    bool glu_swapped = false;
+    int glu_scan_emit = 0;
     for (int j = nup_idx + 1; j < std::min(cgraph->n_nodes, nup_idx + 1 + kSearchWindow); ++j) {
         ggml_tensor * nj = cgraph->nodes[j];
         if (nj == nullptr) continue;
-        if (silu_idx < 0 && nj->op == GGML_OP_UNARY) {
-            // Check if it's silu by looking at the unary op param.
-            // The silu op param is in nj->op_params; for SILU it's
-            // GGML_UNARY_OP_SILU == 9 (from ggml.h).
-            const int unary_op = ggml_get_unary_op(nj);
-            if (unary_op == GGML_UNARY_OP_SILU &&
-                nj->src[0] != nullptr && nj->src[0] == ngate) {
-                silu_idx = j;
-                silu_node = nj;
-            }
-            continue;
+        if (nj->op != GGML_OP_GLU) continue;
+        if (nj->src[0] == nullptr || nj->src[1] == nullptr) continue;
+        const int sub_op = static_cast<int>(ggml_get_glu_op(nj));
+        const ggml_tensor * a_root = walk_through_views(nj->src[0]);
+        const ggml_tensor * b_root = walk_through_views(nj->src[1]);
+        if (s_mlp_trace && glu_scan_emit++ < 6) {
+            GGML_LOG_INFO("MLP scan: j=%d GLU sub_op=%d a_root=%p b_root=%p ngate=%p nup=%p\n",
+                          j, sub_op, (void*)a_root, (void*)b_root,
+                          (void*)ngate, (void*)nup);
         }
-        if (silu_idx >= 0 && mul_idx < 0 && nj->op == GGML_OP_MUL) {
-            // mul that uses silu_node and nup
-            const bool a = (nj->src[0] == silu_node && nj->src[1] == nup);
-            const bool b = (nj->src[1] == silu_node && nj->src[0] == nup);
-            if (a || b) {
-                mul_idx = j;
-                mul_node = nj;
-                break;
-            }
+        // Accept SWIGLU (Qwen3, Llama3) and GEGLU (Gemma).
+        if (sub_op != GGML_GLU_OP_SWIGLU && sub_op != GGML_GLU_OP_GEGLU) continue;
+        const bool order_a = (a_root == ngate && b_root == nup);
+        const bool order_b = (a_root == nup && b_root == ngate);
+        if (order_a || order_b) {
+            glu_idx = j;
+            glu_node = nj;
+            glu_sub_op_found = sub_op;
+            glu_swapped = order_b;  // gate is in src[1], up in src[0]
+            break;
         }
     }
-    if (silu_idx < 0 || mul_idx < 0) return false;
-    if (mul_node == nullptr) return false;
+    if (glu_idx < 0) { s_stage_no_silu++; trace_dump("no_glu", i); return false; }
+    if (glu_node == nullptr) { s_stage_no_silu++; return false; }
+    // The GLU node IS the fused activation*mul. There is no separate mul.
+    ggml_tensor * mul_node = glu_node;
+    int mul_idx = glu_idx;
+    int silu_idx = glu_idx;  // counter convenience
+
+    // If the swiglu_split's roles are swapped (gate is src[1], up is
+    // src[0]), the SwiGLU semantics are act(src[0]) * src[1] -- so the
+    // ACTIVATION is applied to nup not ngate. Bail in that case for
+    // safety; iter21 can teach the kernel to swap.
+    if (glu_swapped) { s_stage_no_silu++; trace_dump("glu_swapped", i); return false; }
 
     // Sanity: mul output shape should match the gate matmul shape.
     if (mul_node->ne[0] != ngate->ne[0] || mul_node->ne[1] != ngate->ne[1]) return false;
@@ -2607,6 +2677,9 @@ bool ggml_sycl_q4k_mlp_fuse_inline(
     fargs.n_cols          = ncols_y;
     fargs.x_col_stride    = static_cast<std::size_t>(ncols_x);
     fargs.y_col_stride    = static_cast<std::size_t>(mul_node->nb[1] / sizeof(float));
+    fargs.activation      =
+        (glu_sub_op_found == GGML_GLU_OP_GEGLU) ? GGML_SYCL_ESIMD_MLP_GELU
+                                                : GGML_SYCL_ESIMD_MLP_SILU;
 
     static int s_mlp_count[GGML_SYCL_MAX_DEVICES] = {};
     static int s_mlp_total = 0;
@@ -2620,12 +2693,15 @@ bool ggml_sycl_q4k_mlp_fuse_inline(
                       s_mlp_count[0], s_mlp_count[1], s_mlp_count[2]);
     }
 
+    s_stage_dispatched++;
+    trace_dump("dispatched", i);
     ggml_sycl_esimd_fused_mlp_gate_up_dispatch(*stream, fargs);
 
-    // Mark gate, up, silu, mul as NONE. The fused kernel wrote into
-    // mul_node->data so any downstream consumer of that pointer sees
+    // Mark gate, up, glu as NONE. The fused kernel wrote into
+    // glu_node->data so any downstream consumer of that pointer sees
     // the right values.
     auto mark = [&](ggml_tensor * n) {
+        if (n == nullptr) return;
         if (restore_list != nullptr) {
             restore_list->push_back({n, static_cast<int>(n->op)});
         }
@@ -2633,8 +2709,9 @@ bool ggml_sycl_q4k_mlp_fuse_inline(
     };
     mark(ngate);
     mark(nup);
-    mark(silu_node);
-    mark(mul_node);
+    mark(glu_node);
+    (void) silu_idx;
+    (void) mul_idx;
 
     return true;
 }

@@ -20,6 +20,15 @@
 #include <cstdint>
 #include <sycl/sycl.hpp>
 
+// iter20: activation function selector for the fused MLP epilogue.
+// Match ggml's GLU sub-op enum so we can pass it through directly.
+//   SWIGLU : Qwen3, Llama3, Mistral — silu(gate) * up
+//   GEGLU  : Gemma 1/2/3/4 — gelu_tanh(gate) * up
+enum ggml_sycl_esimd_mlp_activation {
+    GGML_SYCL_ESIMD_MLP_SILU = 0,
+    GGML_SYCL_ESIMD_MLP_GELU = 1,
+};
+
 struct ggml_sycl_esimd_fused_mlp_gate_up_args {
     const std::uint8_t * gate_payload;  // Q4K SoA
     const std::uint8_t * gate_meta;
@@ -28,10 +37,11 @@ struct ggml_sycl_esimd_fused_mlp_gate_up_args {
     int                  n_blocks_per_row;  // both gate and up share this
     int                  n_rows;            // output rows (e.g. 21504 for Gemma 4 31B FFN)
     const float *        x;
-    float *              y;                 // silu(gate) * up output
+    float *              y;                 // act(gate) * up output
     int                  n_cols;            // batch size
     std::size_t          x_col_stride;
     std::size_t          y_col_stride;
+    int                  activation;        // ggml_sycl_esimd_mlp_activation
 };
 
 void ggml_sycl_esimd_fused_mlp_gate_up_dispatch(
