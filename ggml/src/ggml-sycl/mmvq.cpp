@@ -1,4 +1,5 @@
 #include "mmvq.hpp"
+#include "ggml-backend-impl.h"
 
 #include "ggml.h"
 #include "ggml-quants.h"
@@ -2031,6 +2032,331 @@ void run_q4k_fused_qkv(
             });
     });
 }
+
+} // namespace -- iter16 fusion entry points need EXTERNAL linkage so
+  // ggml-sycl.cpp can call them. Re-opened below the iter16 block.
+
+/* gemma4-ipex iter16: GRAPH-LEVEL QKV fusion pre-pass.
+
+   This is the real port of the cleanroom's local_backend_graph_compute
+   architecture (src/ggml_sycl_clone_exports.cpp:6587). Called from
+   ggml_backend_sycl_graph_compute BEFORE the existing graph_compute_impl
+   loop, with the full cgraph in hand. Scans for QKV triples (3 consecutive
+   MUL_MAT nodes with Q4_K src[0] sharing src[1] data pointer), dispatches
+   the fused kernel directly via sycl_ctx->stream(), and marks the 3 nodes
+   as GGML_OP_NONE so graph_compute_impl's loop skips them. The caller
+   restores the original op values after impl returns.
+
+   Key difference from iter14's failed dispatch-time approach: this reads
+   and writes tensor->data directly, which is tensor-lifetime-stable.
+   dst_dd_i (the pool-alloc'd per-op scratch) is not involved at this
+   level -- we're one layer above the per-op dispatch loop.
+
+   These functions live OUTSIDE the file's anonymous namespace so the
+   linker can see them from ggml-sycl.cpp. They reference PendingQ4K and
+   run_q4k_fused_qkv from the anonymous namespace by unqualified name --
+   that's legal because anon-namespace symbols are accessible from
+   surrounding scope in the same TU. */
+
+#include <algorithm>
+
+// SyclQ4KFusionRestoreEntry / SyclQ4KFusionRestoreList are declared in mmvq.hpp.
+
+// Layout-matching read of the first int field of
+// `ggml_backend_sycl_buffer_context` (defined in ggml-sycl.cpp at line ~350).
+// That struct's first member is `int device;`. We can't include the struct
+// header from here without exposing the whole context, so we cast and read
+// the first int. Returns -1 if the buffer is NULL or this isn't a SYCL
+// buffer (e.g. host buffer or split buffer with the dummy 0x1000 base).
+static int sycl_buffer_device(const ggml_tensor * t) {
+    if (t == nullptr || t->buffer == nullptr || t->buffer->context == nullptr) {
+        return -1;
+    }
+    // Split-buffer context has a different layout; identify it by the
+    // dummy data sentinel from get_base().
+    if (t->data == (void *) 0x1000) {
+        return -1;
+    }
+    return *reinterpret_cast<const int *>(t->buffer->context);
+}
+
+static PendingQ4K make_pending_from_tensor(ggml_tensor * node) {
+    PendingQ4K op{};
+    op.vx = node->src[0]->data;
+    op.x  = static_cast<const float *>(node->src[1]->data);
+    op.dst = static_cast<float *>(node->data);
+    op.ncols_x = static_cast<int>(node->src[0]->ne[0]);
+    op.nrows_x = static_cast<int>(node->src[0]->ne[1]);
+    op.ncols_y = static_cast<int>(node->src[1]->ne[1]);
+    // Row stride in floats for dst.
+    op.dst_col_stride = static_cast<std::size_t>(node->nb[1] / sizeof(float));
+    return op;
+}
+
+// Scan the cgraph for QKV fusible triples and dispatch the fused kernel
+// for each. Returns a list of (node, original_op) pairs that the caller
+// must pass to restore_nodes() after graph_compute_impl returns.
+SyclQ4KFusionRestoreList ggml_sycl_q4k_qkv_prefuse_pass(
+    sycl::queue * stream,
+    int           device,
+    ggml_cgraph * cgraph) {
+    SyclQ4KFusionRestoreList restore_list;
+    if (!ggml_sycl_debug_q4k_qkv_fusion_enabled()) {
+        return restore_list;
+    }
+    if (stream == nullptr || cgraph == nullptr) {
+        return restore_list;
+    }
+
+    static int s_trace = 0;
+    const bool trace = (s_trace++ < 3);
+
+    if (trace) {
+        GGML_LOG_INFO("Q4_K QKV graph-fuse SCAN call#%d device=%d nodes=%d\n",
+                      s_trace - 1, device, cgraph->n_nodes);
+    }
+
+    for (int i = 0; i < cgraph->n_nodes - 2; ++i) {
+        ggml_tensor * n0 = cgraph->nodes[i];
+        if (n0 == nullptr || n0->op != GGML_OP_MUL_MAT) continue;
+        if (n0->src[0] == nullptr || n0->src[1] == nullptr) continue;
+        if (n0->src[0]->type != GGML_TYPE_Q4_K) continue;
+
+        // iter16 root cause: with multi-GPU layer-split, each layer's
+        // weights live on a single device but `graph_compute` runs on
+        // EACH backend in turn with the same logical cgraph. We must
+        // only fuse a triple whose weights+activations live on the
+        // CURRENT backend's device, otherwise we'd dispatch on a stream
+        // bound to device A while reading USM owned by device B (the
+        // exact UB pattern that produces the "a a a a" garbage we saw).
+        // Split-buffer (`-sm row`) is NOT supported here yet -- the
+        // helper returns -1 for the 0x1000 sentinel and we skip below.
+        const int n0_dev = sycl_buffer_device(n0->src[0]);
+        if (n0_dev != device) {
+            continue;
+        }
+
+        const void * src1_data = n0->src[1]->data;
+        if (src1_data == nullptr) continue;
+
+        // Find next 2 consecutive MUL_MAT nodes with Q4_K src[0] and
+        // matching src[1]->data. Non-MUL_MAT nodes in between are
+        // tolerated (the cleanroom also scans forward past
+        // non-matmul nodes via `break` on mismatch).
+        int partners[2] = {-1, -1};
+        int found = 0;
+        for (int j = i + 1; j < cgraph->n_nodes && found < 2; ++j) {
+            ggml_tensor * nj = cgraph->nodes[j];
+            if (nj == nullptr) continue;
+            if (nj->op != GGML_OP_MUL_MAT) continue;
+            if (nj->src[0] == nullptr || nj->src[1] == nullptr) break;
+            if (nj->src[0]->type != GGML_TYPE_Q4_K) break;  // Q4_K+Q4_K+Q4_K only for now
+            if (nj->src[1]->data != src1_data) break;
+            partners[found++] = j;
+        }
+        if (found != 2) continue;
+
+        ggml_tensor * nq = n0;
+        ggml_tensor * nk = cgraph->nodes[partners[0]];
+        ggml_tensor * nv = cgraph->nodes[partners[1]];
+
+        // Shape check: all three must share ncols_x and ncols_y.
+        if (nq->src[0]->ne[0] != nk->src[0]->ne[0] ||
+            nq->src[0]->ne[0] != nv->src[0]->ne[0]) continue;
+        if (nq->src[1]->ne[1] != nk->src[1]->ne[1] ||
+            nq->src[1]->ne[1] != nv->src[1]->ne[1]) continue;
+
+        // Shape gate: same as iter13's scalar kernel (ncols_y == 8,
+        // ncols_x == 5376) since we're reusing iter14's fused kernel
+        // which is built on iter13's math.
+        const int ncols_x = static_cast<int>(nq->src[0]->ne[0]);
+        const int ncols_y = static_cast<int>(nq->src[1]->ne[1]);
+        if (ncols_y != 8 || ncols_x != 5376) continue;
+
+        PendingQ4K q_op = make_pending_from_tensor(nq);
+        PendingQ4K k_op = make_pending_from_tensor(nk);
+        PendingQ4K v_op = make_pending_from_tensor(nv);
+
+        // Must have valid data pointers on all sides.
+        if (q_op.vx == nullptr || k_op.vx == nullptr || v_op.vx == nullptr) continue;
+        if (q_op.dst == nullptr || k_op.dst == nullptr || v_op.dst == nullptr) continue;
+        if (q_op.x == nullptr) continue;
+
+        // All three weights, the shared activation, and the three dsts
+        // must live on the same device as the current sycl_ctx. (n0 was
+        // already checked above; check the others to defend against the
+        // pathological case of mixed-device fusion candidates.)
+        if (sycl_buffer_device(nk->src[0]) != device) continue;
+        if (sycl_buffer_device(nv->src[0]) != device) continue;
+        if (sycl_buffer_device(nq->src[1]) != device) continue;
+        if (sycl_buffer_device(nq) != device) continue;
+        if (sycl_buffer_device(nk) != device) continue;
+        if (sycl_buffer_device(nv) != device) continue;
+
+        if (trace) {
+            GGML_LOG_INFO(
+                "Q4_K QKV graph-fuse: nodes=%d,%d,%d rows=%d,%d,%d ncols_x=%d ncols_y=%d\n",
+                i, partners[0], partners[1],
+                q_op.nrows_x, k_op.nrows_x, v_op.nrows_x,
+                ncols_x, ncols_y);
+        }
+
+        run_q4k_fused_qkv(q_op, k_op, v_op, stream);
+
+        // ITER16 ISOLATION: do NOT skip the original ops. Caller will
+        // run my kernel AFTER impl, so the kernel writes are FINAL.
+        // If output is garbage, the kernel produces wrong values; if
+        // correct, the kernel works and the issue is purely in skipping.
+
+        // Advance past the fused triple.
+        i = partners[1];
+    }
+
+    return restore_list;
+}
+
+void ggml_sycl_q4k_qkv_restore_nodes(SyclQ4KFusionRestoreList & restore_list) {
+    for (auto & e : restore_list) {
+        e.node->op = static_cast<ggml_op>(e.original_op);
+    }
+    restore_list.clear();
+}
+
+// iter16 in-loop fusion. Called from graph_compute_impl at each node.
+// If `i` is a Q4_K MUL_MAT and the next 2 Q4_K MUL_MATs in the graph
+// (skipping intermediate reshape/RoPE/etc.) share src[1]->data with it
+// AND all live on this backend's device, dispatches the fused kernel
+// on this backend's stream and marks the K and V nodes as GGML_OP_NONE
+// so the impl loop skips them when it reaches them later. Intermediate
+// ops between Q and K/V run normally and consume the Q output that the
+// fused kernel just wrote. Returns true on fused dispatch.
+bool ggml_sycl_q4k_qkv_fuse_inline(
+    ggml_backend_sycl_context * sycl_ctx,
+    ggml_cgraph *               cgraph,
+    int                         i,
+    SyclQ4KFusionRestoreList *  restore_list) {
+    if (!ggml_sycl_debug_q4k_qkv_fusion_enabled()) return false;
+    if (sycl_ctx == nullptr || cgraph == nullptr) return false;
+    if (i < 0 || i >= cgraph->n_nodes) return false;
+
+    ggml_tensor * nq = cgraph->nodes[i];
+    if (nq == nullptr || nq->op != GGML_OP_MUL_MAT) return false;
+    if (nq->src[0] == nullptr || nq->src[1] == nullptr) return false;
+    if (nq->src[0]->type != GGML_TYPE_Q4_K) return false;
+
+    // Verify nq is on this backend's device.
+    const int device = sycl_ctx->device;
+    if (sycl_buffer_device(nq->src[0]) != device) return false;
+    if (sycl_buffer_device(nq->src[1]) != device) return false;
+    if (sycl_buffer_device(nq) != device) return false;
+
+    // Find next 2 Q4_K MUL_MAT nodes whose src[1] is the SAME ggml_tensor
+    // as nq->src[1]. Pointer-equal `tensor->data` is NOT sufficient: the
+    // ggml graph allocator reuses buffer slots across tensors with
+    // non-overlapping lifetimes, so two different intermediate tensors
+    // (e.g. layer N's attn_norm vs layer N+M's attn_norm) can share a
+    // data pointer even though they hold different values. Use tensor
+    // identity (`==`) instead. Limit search to a small window to avoid
+    // matching spurious far-away Q4_K MUL_MATs.
+    ggml_tensor * src1_tensor = nq->src[1];
+    if (src1_tensor == nullptr) return false;
+
+    int k_idx = -1;
+    int v_idx = -1;
+    const int kSearchWindow = 16;
+    const int j_max = std::min(cgraph->n_nodes, i + 1 + kSearchWindow);
+    for (int j = i + 1; j < j_max; ++j) {
+        ggml_tensor * nj = cgraph->nodes[j];
+        if (nj == nullptr) continue;
+        if (nj->op != GGML_OP_MUL_MAT) continue;
+        if (nj->src[0] == nullptr || nj->src[1] == nullptr) continue;
+        if (nj->src[0]->type != GGML_TYPE_Q4_K) continue;
+        if (nj->src[1] != src1_tensor) continue;
+        if (k_idx < 0) {
+            k_idx = j;
+        } else {
+            v_idx = j;
+            break;
+        }
+    }
+    if (k_idx < 0 || v_idx < 0) return false;
+
+    ggml_tensor * nk = cgraph->nodes[k_idx];
+    ggml_tensor * nv = cgraph->nodes[v_idx];
+
+    if (sycl_buffer_device(nk->src[0]) != device) return false;
+    if (sycl_buffer_device(nv->src[0]) != device) return false;
+    if (sycl_buffer_device(nk) != device) return false;
+    if (sycl_buffer_device(nv) != device) return false;
+
+    if (nq->src[0]->ne[0] != nk->src[0]->ne[0] ||
+        nq->src[0]->ne[0] != nv->src[0]->ne[0]) return false;
+    if (nq->src[1]->ne[1] != nk->src[1]->ne[1] ||
+        nq->src[1]->ne[1] != nv->src[1]->ne[1]) return false;
+
+    const int ncols_x = static_cast<int>(nq->src[0]->ne[0]);
+    const int ncols_y = static_cast<int>(nq->src[1]->ne[1]);
+    if (ncols_y != 8) return false;
+    if (ncols_x != 5376) return false;
+
+    PendingQ4K q_op = make_pending_from_tensor(nq);
+    PendingQ4K k_op = make_pending_from_tensor(nk);
+    PendingQ4K v_op = make_pending_from_tensor(nv);
+    if (q_op.vx == nullptr || k_op.vx == nullptr || v_op.vx == nullptr) return false;
+    if (q_op.dst == nullptr || k_op.dst == nullptr || v_op.dst == nullptr) return false;
+    if (q_op.x == nullptr) return false;
+
+    static int  s_count[GGML_SYCL_MAX_DEVICES] = {};
+    static int  s_total = 0;
+    if (device >= 0 && device < GGML_SYCL_MAX_DEVICES) s_count[device]++;
+    s_total++;
+    if (s_total <= 5 || (s_total % 200) == 0) {
+        GGML_LOG_INFO("Q4_K QKV inline-fuse #%d device=%d ncols_y=%d "
+                      "rows=%d,%d,%d (total dev0=%d dev1=%d dev2=%d)\n",
+                      s_total, device, ncols_y,
+                      q_op.nrows_x, k_op.nrows_x, v_op.nrows_x,
+                      s_count[0], s_count[1], s_count[2]);
+    }
+
+    sycl::queue * stream = sycl_ctx->stream();
+    // iter16: dispatch the 3 projections via the proven iter13 scalar
+    // kernel. The iter14 `run_q4k_fused_qkv` (single-launch combined
+    // kernel) is correctness-broken in this in-loop context for unknown
+    // reasons; that investigation is deferred to iter17. Calling the
+    // scalar kernel 3 times here still buys us:
+    //  1. K and V are marked GGML_OP_NONE so the impl loop's per-op
+    //     dispatch overhead (3x quantize_row_q8_1, 3x stage args, 3x
+    //     submit) is avoided.
+    //  2. The 3 dispatches go to the same in-order queue back-to-back,
+    //     so the SYCL runtime can pipeline them with no host sync.
+    //  3. The src1 (activation) is read 3 times instead of once -- a
+    //     bandwidth opportunity that iter17 can claim by getting the
+    //     fused kernel correct.
+    run_q4k_scalar_inline(q_op.vx, q_op.x, q_op.dst,
+                          q_op.ncols_x, q_op.nrows_x, q_op.ncols_y,
+                          q_op.dst_col_stride, stream);
+    run_q4k_scalar_inline(k_op.vx, k_op.x, k_op.dst,
+                          k_op.ncols_x, k_op.nrows_x, k_op.ncols_y,
+                          k_op.dst_col_stride, stream);
+    run_q4k_scalar_inline(v_op.vx, v_op.x, v_op.dst,
+                          v_op.ncols_x, v_op.nrows_x, v_op.ncols_y,
+                          v_op.dst_col_stride, stream);
+    (void) run_q4k_fused_qkv;
+
+    // Mark K and V as no-op so the impl loop skips them when it reaches
+    // those positions. (Q is the current node, the caller will not call
+    // compute_forward on it because we returned true.)
+    if (restore_list != nullptr) {
+        restore_list->push_back({nk, static_cast<int>(nk->op)});
+        restore_list->push_back({nv, static_cast<int>(nv->op)});
+    }
+    nk->op = GGML_OP_NONE;
+    nv->op = GGML_OP_NONE;
+
+    return true;
+}
+
+namespace {  // re-open anonymous namespace for the rest of the file
 
 // Returns true if this dispatch was handled (stashed or fused);
 // the caller should skip the normal stock / iter13 dispatch path.

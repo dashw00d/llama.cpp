@@ -4415,6 +4415,13 @@ catch (sycl::exception const &exc) {
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
 
+    // iter16: in-loop Q4_K QKV fusion. The restore list collects K/V
+    // nodes that get marked GGML_OP_NONE by the inline fusion call so
+    // the impl loop skips them when it reaches their positions. After
+    // the loop, we put the original op values back so the cgraph stays
+    // valid for re-entry on the next decode step.
+    SyclQ4KFusionRestoreList qkv_fusion_restore;
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
@@ -4431,12 +4438,23 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             }
         }
 #endif
+
+        // iter16: try fusing this node + the next 2 Q4_K MUL_MATs (with
+        // any intermediate ops left in place). On success the kernel
+        // runs at this node's position (so upstream src1 is already
+        // computed) and K/V are flagged so the loop skips them later.
+        if (ggml_sycl_q4k_qkv_fuse_inline(sycl_ctx, cgraph, i, &qkv_fusion_restore)) {
+            continue;
+        }
+
         bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
         if (!ok) {
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
         GGML_ASSERT(ok);
     }
+
+    ggml_sycl_q4k_qkv_restore_nodes(qkv_fusion_restore);
 }
 
 #ifdef GGML_SYCL_GRAPH
@@ -4485,6 +4503,11 @@ static bool check_graph_compatibility(ggml_cgraph * cgraph) {
 static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     auto * sycl_ctx = static_cast<ggml_backend_sycl_context *>(backend->context);
 
+    // Iter16: Q4_K QKV fusion is handled INLINE inside graph_compute_impl
+    // (see the ggml_sycl_q4k_qkv_fuse_inline call in the loop body). The
+    // earlier pre-pass approach was wrong because it dispatched the fused
+    // kernel BEFORE upstream src1 was computed.
+
 #ifdef GGML_SYCL_GRAPH
     bool use_sycl_graph = !g_ggml_sycl_disable_graph && check_graph_compatibility(cgraph);
     if (use_sycl_graph) {
@@ -4525,6 +4548,7 @@ static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_
     {
         ggml_backend_sycl_graph_compute_impl(sycl_ctx, cgraph);
     }
+
     return GGML_STATUS_SUCCESS;
 }
 
