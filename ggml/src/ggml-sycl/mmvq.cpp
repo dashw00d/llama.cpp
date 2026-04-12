@@ -763,7 +763,10 @@ void ggml_sycl_debug_q4k_esimd_live(
                 }
             });
     });
-    stream->wait();
+    // gemma4-ipex iter8: NO stream->wait() here. Stock dispatch runs the
+    // stream asynchronously -- the in-order SYCL queue serializes subsequent
+    // ops after this submit naturally. The host-side wait was one of the
+    // two sources of the remaining 4x gap after iter7.
 
     // Cache owns payload_dev / meta_dev -- no per-call free.
 }
@@ -1900,6 +1903,16 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                 mul_mat_vec_q3_K_q8_1_sycl(src0_dd_i, src1_ddq_i_bs, dst_dd_i_bs, ne00, row_diff, stream);
                 break;
             case GGML_TYPE_Q4_K:
+                // gemma4-ipex iter8: skip stock MMVQ entirely when the ESIMD
+                // live path will overwrite the result on the gated shape.
+                // Avoids doing the same matmul twice on gated calls.
+                if (ggml_sycl_debug_q4k_esimd_live_should_run(
+                        static_cast<int>(ne00),
+                        static_cast<int>(row_diff),
+                        static_cast<int>(src1_ncols))) {
+                    GGML_SYCL_DEBUG("Skipping stock Q4K MMVQ: ESIMD live path owns this shape\n");
+                    break;
+                }
                 if ((ggml_tensor_extra_gpu *) dst->src[0]->extra &&
                     ((ggml_tensor_extra_gpu *) dst->src[0]->extra)->optimized_feature.reorder) {
                     GGML_SYCL_DEBUG("Calling reorder_mul_mat_vec_q4_k_q8_1_sycl\n");
