@@ -70,4 +70,19 @@ bool ggml_sycl_q4k_mlp_fuse_inline(
     int                         i,
     SyclQ4KFusionRestoreList *  restore_list);
 
+// iter21: fused RMS_NORM + MUL detection + dispatch.
+// Pattern: a GGML_OP_RMS_NORM node followed (within window) by a
+// GGML_OP_MUL where one src is the RMS_NORM output and the other src
+// is a broadcast vector (ne[1]==ne[2]==ne[3]==1). On match dispatches
+// the fused kernel writing into the MUL node's dst, marks both as
+// GGML_OP_NONE. Optional standalone path: if no MUL match, the
+// helper can still dispatch a plain RMS_NORM (the cleanroom does this
+// in standalone mode but iter21 keeps stock for the standalone case
+// to avoid touching the working path).
+bool ggml_sycl_fused_rms_mul_inline(
+    ggml_backend_sycl_context * sycl_ctx,
+    ggml_cgraph *               cgraph,
+    int                         i,
+    SyclQ4KFusionRestoreList *  restore_list);
+
 #endif // GGML_SYCL_MMVQ_HPP

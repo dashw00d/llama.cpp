@@ -4439,6 +4439,13 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
 #endif
 
+        // iter21: try fusing RMS_NORM + MUL into one kernel launch.
+        // Different op type from QKV/MLP fusion -- never conflicts.
+        // Default OFF, env-gated by GGML_SYCL_DEBUG_RMS_MUL_FUSION=1.
+        if (ggml_sycl_fused_rms_mul_inline(sycl_ctx, cgraph, i, &qkv_fusion_restore)) {
+            continue;
+        }
+
         // iter16: try fusing this node + the next 2 Q4_K MUL_MATs (with
         // any intermediate ops left in place). On success the kernel
         // runs at this node's position (so upstream src1 is already

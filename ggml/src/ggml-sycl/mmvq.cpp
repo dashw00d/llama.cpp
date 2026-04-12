@@ -3,6 +3,7 @@
 #include "esimd_q4k_fused.hpp"
 #include "esimd_fused_qkv_proj.hpp"
 #include "esimd_fused_mlp_gate_up.hpp"
+#include "fused_rms_norm_mul.hpp"
 
 #include "ggml.h"
 #include "ggml-quants.h"
@@ -2713,6 +2714,131 @@ bool ggml_sycl_q4k_mlp_fuse_inline(
     (void) silu_idx;
     (void) mul_idx;
 
+    return true;
+}
+
+// iter21: in-loop fused RMS_NORM + MUL detection + dispatch.
+// Pattern: GGML_OP_RMS_NORM at i, followed by GGML_OP_MUL within the
+// next few nodes where one src is the RMS_NORM output and the other
+// src is a broadcast vector (ne[1]==ne[2]==ne[3]==1). On match
+// dispatches the fused kernel writing into the MUL node's dst, marks
+// both as GGML_OP_NONE.
+//
+// Gemma 4 31B has ~8 norms per layer (attn_norm, attn_q_norm,
+// attn_k_norm, attn_post_norm, ffn_norm, ffn_post_norm_1,
+// ffn_pre_norm_2, ffn_post_norm_2) plus weightless raw rms on Vcur.
+// Each norm-with-weight goes through `build_norm` which expands to
+// `ggml_rms_norm(...) -> ggml_mul(...)`. So this fusion should fire
+// ~480 times per decode step at -npl 8 on Gemma 4 / 60 layers /
+// 8 norms per layer.
+bool ggml_sycl_fused_rms_mul_inline(
+    ggml_backend_sycl_context * sycl_ctx,
+    ggml_cgraph *               cgraph,
+    int                         i,
+    SyclQ4KFusionRestoreList *  restore_list) {
+    static const bool s_enabled =
+        std::getenv("GGML_SYCL_DEBUG_RMS_MUL_FUSION") != nullptr;
+    if (!s_enabled) return false;
+    if (sycl_ctx == nullptr || cgraph == nullptr) return false;
+    if (i < 0 || i >= cgraph->n_nodes) return false;
+
+    ggml_tensor * nrms = cgraph->nodes[i];
+    if (nrms == nullptr || nrms->op != GGML_OP_RMS_NORM) return false;
+    if (nrms->src[0] == nullptr) return false;
+    if (nrms->type != GGML_TYPE_F32) return false;
+    if (nrms->src[0]->type != GGML_TYPE_F32) return false;
+    if (!ggml_is_contiguous(nrms)) return false;
+    if (!ggml_is_contiguous(nrms->src[0])) return false;
+
+    const int device = sycl_ctx->device;
+    if (sycl_buffer_device(nrms) != device) return false;
+    if (sycl_buffer_device(nrms->src[0]) != device) return false;
+
+    // ne0 cap from the cleanroom kernel.
+    const std::size_t ne0 = static_cast<std::size_t>(nrms->ne[0]);
+    if (ne0 == 0 || ne0 > 8192) return false;
+
+    // n_rows = product of remaining dims.
+    std::size_t n_rows = 1;
+    for (int d = 1; d < GGML_MAX_DIMS; ++d) {
+        n_rows *= static_cast<std::size_t>(std::max<std::int64_t>(nrms->ne[d], 1));
+    }
+    if (n_rows == 0) return false;
+
+    // Pull eps from RMS_NORM op_params (offset 0).
+    float eps = 0.0f;
+    std::memcpy(&eps, nrms->op_params, sizeof(float));
+
+    // Look forward for a MUL whose two srcs are (rms_node, broadcast_vec).
+    const int kSearchWindow = 6;
+    int  mul_idx = -1;
+    ggml_tensor * mul_node = nullptr;
+    const ggml_tensor * weight_src = nullptr;
+    const int j_max = std::min(cgraph->n_nodes, i + 1 + kSearchWindow);
+    for (int j = i + 1; j < j_max; ++j) {
+        ggml_tensor * nj = cgraph->nodes[j];
+        if (nj == nullptr) continue;
+        if (nj->op != GGML_OP_MUL) continue;
+        if (nj->src[0] == nullptr || nj->src[1] == nullptr) continue;
+        // One side must be exactly the RMS_NORM node, the other must
+        // be a broadcast vector (ne[1]==ne[2]==ne[3]==1).
+        const ggml_tensor * a = nj->src[0];
+        const ggml_tensor * b = nj->src[1];
+        const ggml_tensor * other = nullptr;
+        if (a == nrms) other = b;
+        else if (b == nrms) other = a;
+        else continue;
+        if (other == nullptr) continue;
+        if (other->ne[1] != 1 || other->ne[2] != 1 || other->ne[3] != 1) continue;
+        if (other->type != GGML_TYPE_F32) continue;
+        if (other->ne[0] != static_cast<std::int64_t>(ne0)) continue;
+        if (sycl_buffer_device(nj) != device) continue;
+        // The broadcast weight may be on a different device (it's a
+        // weight tensor from the model, possibly replicated). Check
+        // that we can read it from this device.
+        if (sycl_buffer_device(other) != device) continue;
+        if (!ggml_is_contiguous(nj)) continue;
+        weight_src = other;
+        mul_idx  = j;
+        mul_node = nj;
+        break;
+    }
+    if (mul_idx < 0 || mul_node == nullptr || weight_src == nullptr) return false;
+
+    static int s_count[GGML_SYCL_MAX_DEVICES] = {};
+    static int s_total = 0;
+    if (device >= 0 && device < GGML_SYCL_MAX_DEVICES) s_count[device]++;
+    s_total++;
+    if (s_total <= 5 || (s_total % 500) == 0) {
+        GGML_LOG_INFO("RMS+MUL inline-fuse #%d device=%d nodes=%d,%d ne0=%zu n_rows=%zu "
+                      "(total dev0=%d dev1=%d dev2=%d)\n",
+                      s_total, device, i, mul_idx, ne0, n_rows,
+                      s_count[0], s_count[1], s_count[2]);
+    }
+
+    sycl::queue * stream = sycl_ctx->stream();
+
+    ggml_sycl_fused_rms_norm_mul_args fargs{};
+    fargs.src         = static_cast<const float *>(nrms->src[0]->data);
+    fargs.dst         = static_cast<float *>(mul_node->data);
+    fargs.norm_weight = static_cast<const float *>(weight_src->data);
+    fargs.ne0         = ne0;
+    fargs.n_rows      = n_rows;
+    fargs.eps         = eps;
+    if (fargs.src == nullptr || fargs.dst == nullptr || fargs.norm_weight == nullptr) {
+        return false;
+    }
+    ggml_sycl_fused_rms_norm_mul_dispatch(*stream, fargs);
+
+    auto mark = [&](ggml_tensor * n) {
+        if (n == nullptr) return;
+        if (restore_list != nullptr) {
+            restore_list->push_back({n, static_cast<int>(n->op)});
+        }
+        n->op = GGML_OP_NONE;
+    };
+    mark(nrms);
+    mark(mul_node);
     return true;
 }
 
