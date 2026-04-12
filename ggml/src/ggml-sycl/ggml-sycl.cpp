@@ -4733,15 +4733,19 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
 
                 ggml_type src0_type = op->src[0]->type;
 
-                // TODO: The configuration below needs more work to be supported with oneDNN
+                // TODO: The configuration below needs more work to be supported with oneDNN.
+                // Gemma 4's KQ matmul (permuted non-contiguous fp16 K view) tripped this on every
+                // attention layer and forced the op to CPU. Bypassed; revert if output goes wrong.
                 if (ggml_is_permuted(a) && !ggml_is_contiguous(a) &&
-                    a->ne[2] > 1 && a->ne[3] > 1 && src0_type == GGML_TYPE_F16) {
+                    a->ne[2] > 1 && a->ne[3] > 1 && src0_type == GGML_TYPE_F16 &&
+                    /* gemma4-bypass */ false) {
                   return false;
                 }
 
-                // TODO: This specific configuration can fail with oneDNN and needs more debugging
+                // TODO: This specific configuration can fail with oneDNN and needs more debugging.
                 if (!ggml_is_permuted(a) && ggml_is_permuted(b) && b->ne[2] > 1 && b->ne[3] > 1 &&
-                    a->ne[0] > 128 && a->ne[2] == 1 && src0_type == GGML_TYPE_F16) {
+                    a->ne[0] > 128 && a->ne[2] == 1 && src0_type == GGML_TYPE_F16 &&
+                    /* gemma4-bypass */ false) {
                     return false;
                 }
                 return true;
