@@ -1633,19 +1633,141 @@ bool ggml_sycl_debug_q4k_xmx_fp16_scalar_should_run(int ncols_x, int nrows_x, in
     if (!ggml_sycl_debug_q4k_xmx_fp16_scalar_enabled()) {
         return false;
     }
-    // iter14: TRIED widening the gate to accept all Q4_K shapes at
-    // ncols_y==8. Measured regression 6.20 -> 4.88 t/s at -npl 8.
-    // Cause: the scalar kernel is shape-sensitive. It is fast at
-    // 5376x{4k,8k,16k,21k} (moderate K, large N, full hardware
-    // utilisation with 1-thread-per-row) but slow at 21504x1792
-    // (ffn_down per-GPU slice -- large K, small N, only 44% of
-    // the Arc 4096-thread pool used). Reverted to iter13's narrow
-    // gate. Entry 15 will either write a cooperative-warp variant
-    // for the ffn_down shape or graph-fuse the qkv triple.
-    if (ncols_y != 8 || ncols_x != 5376 || nrows_x <= 0) {
+    if (ncols_y != 8 || nrows_x <= 0) {
         return false;
     }
-    return true;
+    // iter15: SHAPE-SPECIFIC dispatch. Only take over the shapes where
+    // our kernel is known to beat stock:
+    //   - ncols_x == 5376 (iter13 scalar wins at 6.20 t/s)
+    //   - ncols_x != 5376 && nrows_x < 1500 (ffn_down-per-GPU, where
+    //     the cooperative-warp variant might beat stock since stock
+    //     already has poor utilisation on small-N large-K shapes)
+    // Other shapes fall through to stock.
+    if (ncols_x == 5376) {
+        return true;
+    }
+    if (nrows_x < 1500 && (ncols_x % QK_K) == 0) {
+        return true;
+    }
+    return false;
+}
+
+/* gemma4-ipex iter15: cooperative-warp variant of the iter13 scalar
+   kernel. One subgroup (16 threads on Arc) per output row, threads
+   split the block_q4_K blocks strided, subgroup reduction sums the
+   partials. Wins shapes where nrows_x is smaller than Arc's 4096-
+   thread pool because 1-thread-per-row can't saturate the hardware
+   (the iter14 widening regression at ffn_down 21504x1792). Uses the
+   same inline Q4_K AoS dequant as iter13 -- correctness-equivalent,
+   different parallelism pattern. */
+
+void run_q4k_scalar_cooperative(
+    const void * vx,
+    const float * x,
+    float * dst,
+    int ncols_x,
+    int nrows_x,
+    int ncols_y,
+    size_t dst_col_stride,
+    dpct::queue_ptr stream) {
+    constexpr int SG = 16;
+    const block_q4_K * vx_blocks = static_cast<const block_q4_K *>(vx);
+    const int n_blocks_per_row_local = ncols_x / QK_K;
+
+    float * const y_base = dst;
+    const auto nr = nrows_x;
+    const auto nc = ncols_y;
+    const auto ne0_val = ncols_x;
+    const auto x_stride = static_cast<size_t>(ncols_x);
+    const auto y_stride = dst_col_stride;
+    const auto x_base = x;
+
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(
+                sycl::range<1>(static_cast<std::size_t>(nr) * SG),
+                sycl::range<1>(SG)),
+            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+                auto sg = it.get_sub_group();
+                const int row = static_cast<int>(it.get_group(0));
+                const int lid = static_cast<int>(it.get_local_linear_id());
+                if (row >= nr) {
+                    return;
+                }
+
+                auto fp16_to_fp32 = [](std::uint16_t h) -> float {
+                    std::uint32_t s = (static_cast<std::uint32_t>(h & 0x8000U)) << 16;
+                    std::uint32_t e = (h >> 10) & 0x1fU;
+                    std::uint32_t m = h & 0x03ffU;
+                    if (e == 0x1fU) return 0.0f;
+                    if (e == 0) {
+                        if (m == 0) return 0.0f;
+                        float val = static_cast<float>(m) * (1.0f/1024.0f) * (1.0f/16384.0f);
+                        return (h & 0x8000U) ? -val : val;
+                    }
+                    return sycl::bit_cast<float>(s | ((e + 112U) << 23) | (m << 13));
+                };
+
+                float acc[8] = {};
+                // Strided block loop: each of SG threads handles a
+                // disjoint subset of the n_blocks_per_row blocks.
+                for (int ib = lid; ib < n_blocks_per_row_local; ib += SG) {
+                    const block_q4_K & block =
+                        vx_blocks[static_cast<std::size_t>(row) * n_blocks_per_row_local + ib];
+                    const std::uint8_t * bytes =
+                        reinterpret_cast<const std::uint8_t *>(&block);
+                    const std::uint16_t d_raw = bytes[0] | (static_cast<std::uint16_t>(bytes[1]) << 8);
+                    const std::uint16_t dm_raw = bytes[2] | (static_cast<std::uint16_t>(bytes[3]) << 8);
+                    const float d_val = fp16_to_fp32(d_raw);
+                    const float neg_dmin = -fp16_to_fp32(dm_raw);
+                    const std::uint8_t * sc = bytes + 4;
+
+                    float scales[8];
+                    float biases[8];
+                    for (int i = 0; i < 4; ++i) {
+                        const std::uint8_t a = sc[0 + i];
+                        const std::uint8_t b = sc[4 + i];
+                        const std::uint8_t c = sc[8 + i];
+                        scales[i]     = d_val    * static_cast<float>(a & 0x3FU);
+                        scales[i + 4] = d_val    * static_cast<float>((c & 0x0FU) | ((a >> 2) & 0x30U));
+                        biases[i]     = neg_dmin * static_cast<float>(b & 0x3FU);
+                        biases[i + 4] = neg_dmin * static_cast<float>((c >> 4) | ((b >> 2) & 0x30U));
+                    }
+
+                    const std::uint8_t * qs = block.qs;
+                    for (int pair = 0; pair < 4; ++pair) {
+                        const float s_lo = scales[pair * 2];
+                        const float b_lo = biases[pair * 2];
+                        const float s_hi = scales[pair * 2 + 1];
+                        const float b_hi = biases[pair * 2 + 1];
+                        const std::uint8_t * pair_bytes = qs + pair * 32;
+                        for (int j = 0; j < 32; ++j) {
+                            const std::uint8_t packed = pair_bytes[j];
+                            const float w_lo = s_lo * static_cast<float>(packed & 0x0FU) + b_lo;
+                            const float w_hi = s_hi * static_cast<float>(packed >> 4) + b_hi;
+                            const int k_lo = ib * 256 + pair * 64 + j;
+                            const int k_hi = ib * 256 + pair * 64 + 32 + j;
+                            for (int c = 0; c < nc; ++c) {
+                                acc[c] += w_lo * x_base[c * x_stride + k_lo];
+                                acc[c] += w_hi * x_base[c * x_stride + k_hi];
+                            }
+                        }
+                    }
+                }
+
+                // Subgroup reduction across the 16 threads sharing this row.
+                for (int c = 0; c < nc; ++c) {
+                    acc[c] = sycl::reduce_over_group(sg, acc[c], sycl::plus<float>());
+                }
+
+                // Thread 0 of each subgroup writes dst.
+                if (lid == 0) {
+                    for (int c = 0; c < nc; ++c) {
+                        y_base[c * y_stride + row] = acc[c];
+                    }
+                }
+            });
+    });
 }
 
 /* gemma4-ipex iter14: factor out iter13's scalar kernel body into a
@@ -1999,10 +2121,17 @@ void ggml_sycl_debug_q4k_xmx_fp16_scalar_live(
         }
     }
 
-    // iter14: call the factored helper which has the same body as
-    // iter13-rev5 (plain SYCL scalar per-row + inline AoS dequant).
-    run_q4k_scalar_inline(vx, x, dst, ncols_x, nrows_x, ncols_y,
-                          dst_col_stride, stream);
+    // iter15: shape-specific dispatch. For ncols_x == 5376 (iter13's
+    // proven winning shape), use the scalar 1-thread-per-row kernel.
+    // For everything else the should_run gate accepts (small-N shapes
+    // where stock under-utilises), try the cooperative-warp kernel.
+    if (ncols_x == 5376) {
+        run_q4k_scalar_inline(vx, x, dst, ncols_x, nrows_x, ncols_y,
+                              dst_col_stride, stream);
+    } else {
+        run_q4k_scalar_cooperative(vx, x, dst, ncols_x, nrows_x, ncols_y,
+                                   dst_col_stride, stream);
+    }
     (void) row_low;
     return;
 }
