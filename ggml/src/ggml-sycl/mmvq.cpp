@@ -828,9 +828,12 @@ static ggml_sycl_q4k_xmx_live_timing_summary_printer g_q4k_xmx_live_timing_summa
    throughput = weighted average of the two. */
 
 struct ggml_sycl_q4k_xmx_fp16_cached {
-    sycl::half * fp16_dev;   // device pointer, transposed [K][N]
-    int          nrows_x;    // N (output rows for this device slice)
-    int          ncols_x;    // K (reduction dim)
+    // Stored as uint16_t* on device to avoid sycl::half strict-aliasing
+    // issues. The kernel reads the raw 16-bit pattern and converts to
+    // float manually. Each element is still an fp16 bit pattern.
+    std::uint16_t * fp16_dev;
+    int             nrows_x;   // N (output rows for this device slice)
+    int             ncols_x;   // K (reduction dim)
 };
 
 struct ggml_sycl_q4k_xmx_fp16_arena_device {
@@ -958,9 +961,9 @@ const ggml_sycl_q4k_xmx_fp16_cached * ggml_sycl_debug_q4k_xmx_fp16_cache_lookup(
         vx_host.size() * sizeof(block_q4_K)).wait()));
 
     // iter12-rev6: use ggml_fp32_to_fp16 (ggml's own reference converter)
-    // directly. My hand-rolled converter was producing wrong bits and I'm
-    // not going to waste more time debugging it when the reference is right
-    // there. Store as raw uint16 so no sycl::half host code is involved.
+    // directly. Store as raw uint16 so no sycl::half host code is involved.
+    // iter13: diagnostic is captured RIGHT AFTER the first row is written,
+    // so the fp32 values logged match the fp16 values logged.
     std::vector<std::uint16_t> fp16_host(total_elements);
     std::vector<float> row_fp32(static_cast<size_t>(ncols_x));
     for (int n = 0; n < nrows_x; ++n) {
@@ -971,24 +974,20 @@ const ggml_sycl_q4k_xmx_fp16_cached * ggml_sycl_debug_q4k_xmx_fp16_cache_lookup(
         for (int k = 0; k < ncols_x; ++k) {
             row_out[k] = static_cast<std::uint16_t>(ggml_fp32_to_fp16(row_fp32[k]));
         }
-    }
-
-    // iter12-rev5 diagnostic: dump raw fp16 bits + expected float values
-    // for the first few elements.
-    {
-        static bool dumped = false;
-        if (!dumped) {
-            dumped = true;
-            GGML_LOG_INFO(
-                "Q4_K XMX FP16 cache rev5 sample: raw=0x%04x 0x%04x 0x%04x 0x%04x "
-                "expected fp32=%.6f %.6f %.6f %.6f\n",
-                fp16_host[0], fp16_host[1], fp16_host[2], fp16_host[3],
-                row_fp32[0], row_fp32[1], row_fp32[2], row_fp32[3]);
+        if (n == 0) {
+            static bool dumped = false;
+            if (!dumped) {
+                dumped = true;
+                GGML_LOG_INFO(
+                    "Q4_K XMX FP16 cache row0 sample: fp32=%.6f %.6f %.6f %.6f  fp16=0x%04x 0x%04x 0x%04x 0x%04x\n",
+                    row_fp32[0], row_fp32[1], row_fp32[2], row_fp32[3],
+                    row_out[0], row_out[1], row_out[2], row_out[3]);
+            }
         }
     }
 
     // Allocate device buffer and upload
-    sycl::half * fp16_dev = sycl::malloc_device<sycl::half>(total_elements, *stream);
+    std::uint16_t * fp16_dev = sycl::malloc_device<std::uint16_t>(total_elements, *stream);
     if (fp16_dev == nullptr) {
         GGML_LOG_INFO(
             "Q4_K XMX FP16 cache malloc_device FAILED: device=%d bytes=%zu -- falling back\n",
@@ -1000,6 +999,24 @@ const ggml_sycl_q4k_xmx_fp16_cached * ggml_sycl_debug_q4k_xmx_fp16_cache_lookup(
         fp16_dev,
         fp16_host.data(),
         new_bytes).wait()));
+
+    // iter13 diagnostic: read back the first 4 halves from device memory
+    // and compare to the host source we just uploaded.
+    {
+        static bool verified = false;
+        if (!verified) {
+            verified = true;
+            std::uint16_t readback[4];
+            SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(
+                readback,
+                fp16_dev,
+                sizeof(readback)).wait()));
+            GGML_LOG_INFO(
+                "Q4_K XMX FP16 cache READBACK: host[0..3]=0x%04x 0x%04x 0x%04x 0x%04x  dev[0..3]=0x%04x 0x%04x 0x%04x 0x%04x\n",
+                fp16_host[0], fp16_host[1], fp16_host[2], fp16_host[3],
+                readback[0], readback[1], readback[2], readback[3]);
+        }
+    }
 
     ggml_sycl_q4k_xmx_fp16_cached entry = { fp16_dev, nrows_x, ncols_x };
     auto [inserted_it, ok] = cache.emplace(vx, entry);
@@ -1595,6 +1612,147 @@ void ggml_sycl_debug_q4k_xmx_live(
    its size cap (so the live dispatch still produces correct output for
    tensors that don't fit the cap). */
 
+/* gemma4-ipex iter13: scalar diagnostic kernel that uses the iter12 fp16
+   cache but reads it via a pure one-thread-per-row GEMV -- no tiles, no
+   SLM, no joint_matrix. The only purpose is to isolate "is the cache
+   data correct?" from "does the joint_matrix path work with the cache?".
+
+   Iter12 spent 7 revs trying kernel variants on top of the cache without
+   first verifying the cache itself. This is the step iter12 skipped.
+
+   If this kernel produces correct output under GGML_SYCL_DEBUG_Q4K_XMX_FP16_SCALAR=1,
+   the cache data is correct and iter12's bug is in the joint_matrix
+   usage. If it produces garbage, the cache fill / upload path is wrong. */
+
+bool ggml_sycl_debug_q4k_xmx_fp16_scalar_enabled() {
+    static const bool enabled = std::getenv("GGML_SYCL_DEBUG_Q4K_XMX_FP16_SCALAR") != nullptr;
+    return enabled;
+}
+
+bool ggml_sycl_debug_q4k_xmx_fp16_scalar_should_run(int ncols_x, int nrows_x, int ncols_y) {
+    if (!ggml_sycl_debug_q4k_xmx_fp16_scalar_enabled()) {
+        return false;
+    }
+    if (ncols_y != 8 || ncols_x != 5376 || nrows_x <= 0) {
+        return false;
+    }
+    return true;
+}
+
+void ggml_sycl_debug_q4k_xmx_fp16_scalar_live(
+    const void * vx,
+    const float * x,
+    float * dst,
+    int device,
+    int ncols_x,
+    int row_low,
+    int nrows_x,
+    int ncols_y,
+    size_t dst_col_stride,
+    dpct::queue_ptr stream) {
+    if (!ggml_sycl_debug_q4k_xmx_fp16_scalar_should_run(ncols_x, nrows_x, ncols_y)) {
+        return;
+    }
+
+    {
+        static bool announced[GGML_SYCL_MAX_DEVICES] = {};
+        if (device >= 0 && device < GGML_SYCL_MAX_DEVICES && !announced[device]) {
+            announced[device] = true;
+            GGML_LOG_INFO(
+                "Q4_K XMX FP16 SCALAR diagnostic active: device=%d ncols_x=%d nrows_x=%d ncols_y=%d dst_stride=%zu row_low=%d\n",
+                device, ncols_x, nrows_x, ncols_y, dst_col_stride, row_low);
+        }
+    }
+
+    // iter13-rev2: bypass the iter12 fp16 cache entirely. Read vx as
+    // block_q4_K * and dequant on the fly inside the kernel. If this
+    // path produces correct output, the iter12 fp16 cache has a bug
+    // somewhere I can't see through the readback. If it's still
+    // garbage, my scalar kernel structure is broken.
+    const block_q4_K * vx_blocks = static_cast<const block_q4_K *>(vx);
+    const int n_blocks_per_row_local = ncols_x / QK_K;
+
+    float * const y_base = dst;
+    const auto nr = nrows_x;
+    const auto nc = ncols_y;
+    const auto ne0_val = ncols_x;
+    const auto x_stride = static_cast<size_t>(ncols_x);
+    const auto y_stride = dst_col_stride;
+    const auto x_base = x;
+
+    stream->submit([&](sycl::handler & cgh) {
+        cgh.parallel_for(
+            sycl::range<1>(static_cast<std::size_t>(nr)),
+            [=](sycl::id<1> row_id) {
+                const int row = static_cast<int>(row_id[0]);
+                if (row >= nr) {
+                    return;
+                }
+                auto fp16_to_fp32 = [](std::uint16_t h) -> float {
+                    std::uint32_t s = (static_cast<std::uint32_t>(h & 0x8000U)) << 16;
+                    std::uint32_t e = (h >> 10) & 0x1fU;
+                    std::uint32_t m = h & 0x03ffU;
+                    if (e == 0x1fU) return 0.0f;
+                    if (e == 0) {
+                        if (m == 0) return 0.0f;
+                        float val = static_cast<float>(m) * (1.0f/1024.0f) * (1.0f/16384.0f);
+                        return (h & 0x8000U) ? -val : val;
+                    }
+                    return sycl::bit_cast<float>(s | ((e + 112U) << 23) | (m << 13));
+                };
+                float acc[8] = {};
+                // Dequant on the fly for this row, one Q4K block at a time.
+                for (int ib = 0; ib < n_blocks_per_row_local; ++ib) {
+                    const block_q4_K & block =
+                        vx_blocks[static_cast<std::size_t>(row) * n_blocks_per_row_local + ib];
+                    const std::uint8_t * bytes =
+                        reinterpret_cast<const std::uint8_t *>(&block);
+                    const std::uint16_t d_raw = bytes[0] | (static_cast<std::uint16_t>(bytes[1]) << 8);
+                    const std::uint16_t dm_raw = bytes[2] | (static_cast<std::uint16_t>(bytes[3]) << 8);
+                    const float d_val = fp16_to_fp32(d_raw);
+                    const float neg_dmin = -fp16_to_fp32(dm_raw);
+                    const std::uint8_t * sc = bytes + 4;
+
+                    // Unpack 8 groups
+                    float scales[8];
+                    float biases[8];
+                    for (int i = 0; i < 4; ++i) {
+                        const std::uint8_t a = sc[0 + i];
+                        const std::uint8_t b = sc[4 + i];
+                        const std::uint8_t c = sc[8 + i];
+                        scales[i]     = d_val    * static_cast<float>(a & 0x3FU);
+                        scales[i + 4] = d_val    * static_cast<float>((c & 0x0FU) | ((a >> 2) & 0x30U));
+                        biases[i]     = neg_dmin * static_cast<float>(b & 0x3FU);
+                        biases[i + 4] = neg_dmin * static_cast<float>((c >> 4) | ((b >> 2) & 0x30U));
+                    }
+
+                    const std::uint8_t * qs = block.qs;
+                    for (int pair = 0; pair < 4; ++pair) {
+                        const float s_lo = scales[pair * 2];
+                        const float b_lo = biases[pair * 2];
+                        const float s_hi = scales[pair * 2 + 1];
+                        const float b_hi = biases[pair * 2 + 1];
+                        const std::uint8_t * pair_bytes = qs + pair * 32;
+                        for (int j = 0; j < 32; ++j) {
+                            const std::uint8_t packed = pair_bytes[j];
+                            const float w_lo = s_lo * static_cast<float>(packed & 0x0FU) + b_lo;
+                            const float w_hi = s_hi * static_cast<float>(packed >> 4) + b_hi;
+                            const int k_lo = ib * 256 + pair * 64 + j;
+                            const int k_hi = ib * 256 + pair * 64 + 32 + j;
+                            for (int c = 0; c < nc; ++c) {
+                                acc[c] += w_lo * x_base[c * x_stride + k_lo];
+                                acc[c] += w_hi * x_base[c * x_stride + k_hi];
+                            }
+                        }
+                    }
+                }
+                for (int c = 0; c < nc; ++c) {
+                    y_base[c * y_stride + row] = acc[c];
+                }
+            });
+    });
+}
+
 void ggml_sycl_debug_q4k_xmx_fp16_live(
     const void * vx,
     const float * x,
@@ -1689,7 +1847,11 @@ void ggml_sycl_debug_q4k_xmx_fp16_live(
     // is a pure cached-read-and-write instead of a scalar dequant, so
     // each thread's inner loop is ~2-3x less arithmetic per K-step.
     {
-        const auto fp16_base = fp16_entry->fp16_dev;
+        // Cache stores uint16, but the iter12-rev3 SLM staging writes
+        // sycl::half directly. Reinterpret the uint16 storage as
+        // sycl::half* for this path.
+        const sycl::half * fp16_base =
+            reinterpret_cast<const sycl::half *>(fp16_entry->fp16_dev);
         const auto x_h = x_half;
         float * const y_base = dst;
         const auto nr = nrows_x;
@@ -2949,6 +3111,13 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                     GGML_SYCL_DEBUG("Skipping stock Q4K MMVQ: XMX FP16 live path owns this shape\n");
                     break;
                 }
+                if (ggml_sycl_debug_q4k_xmx_fp16_scalar_should_run(
+                        static_cast<int>(ne00),
+                        static_cast<int>(row_diff),
+                        static_cast<int>(src1_ncols))) {
+                    GGML_SYCL_DEBUG("Skipping stock Q4K MMVQ: XMX FP16 scalar diagnostic owns this shape\n");
+                    break;
+                }
                 // gemma4-ipex iter9: optional stock timing on the gated shape
                 // (same criteria as live path). Run with LIVE env unset so
                 // stock actually executes.
@@ -3070,6 +3239,17 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
             static_cast<size_t>(dst->ne[0]),
             stream);
         ggml_sycl_debug_q4k_xmx_fp16_live(
+            src0_dd_i,
+            src1_ddf_i,
+            dst_dd_i,
+            id,
+            static_cast<int>(ne00),
+            static_cast<int>(row_low),
+            static_cast<int>(row_diff),
+            static_cast<int>(src1_ncols),
+            static_cast<size_t>(dst->ne[0]),
+            stream);
+        ggml_sycl_debug_q4k_xmx_fp16_scalar_live(
             src0_dd_i,
             src1_ddf_i,
             dst_dd_i,
