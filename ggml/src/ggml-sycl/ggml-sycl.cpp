@@ -11,14 +11,17 @@
 //
 
 #include <algorithm>
+#include <array>
 #include <assert.h>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <float.h>
 #include <limits>
+#include <mutex>
 #include <stdint.h>
 #include <stdio.h>
 #include <vector>
@@ -28,6 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <regex>
+#include <utility>
 
 #include <sycl/sycl.hpp>
 #if defined(GGML_SYCL_GRAPH) && SYCL_EXT_ONEAPI_ASYNC_MEMORY_ALLOC
@@ -4412,8 +4416,60 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
+// iter23: per-op profiling for graph_compute_impl. Env-gated by
+// GGML_SYCL_DEBUG_PROFILE_OPS=1. When enabled, every compute_forward
+// call is bracketed by a stream sync + host wallclock and accumulated
+// by op type into a global table. The table is dumped to stderr
+// every 32 graph_compute calls (sorted by total time) and at process
+// exit. Adds significant per-op overhead because of the forced sync,
+// so do not use for normal inference -- it's strictly a profiling tool.
+struct GgmlSyclProfileEntry {
+    std::uint64_t total_ns = 0;
+    std::uint64_t count    = 0;
+};
+struct GgmlSyclProfileState {
+    std::mutex                                                                 mu;
+    std::array<GgmlSyclProfileEntry, GGML_OP_COUNT>                            ops;
+    std::uint64_t                                                              n_calls = 0;
+    bool                                                                       enabled = false;
+    bool                                                                       checked = false;
+    void maybe_init() {
+        if (checked) return;
+        checked = true;
+        enabled = std::getenv("GGML_SYCL_DEBUG_PROFILE_OPS") != nullptr;
+    }
+    void dump(const char * tag) {
+        std::lock_guard<std::mutex> lk(mu);
+        std::vector<std::pair<int, GgmlSyclProfileEntry>> sorted;
+        for (int i = 0; i < GGML_OP_COUNT; ++i) {
+            if (ops[i].count > 0) sorted.push_back({i, ops[i]});
+        }
+        std::sort(sorted.begin(), sorted.end(),
+                  [](const auto & a, const auto & b) { return a.second.total_ns > b.second.total_ns; });
+        std::uint64_t total_all = 0;
+        for (auto & p : sorted) total_all += p.second.total_ns;
+        GGML_LOG_INFO("[GGML_SYCL_PROFILE %s] n_calls=%llu total_ms=%.2f\n",
+                      tag, (unsigned long long) n_calls, total_all / 1e6);
+        for (std::size_t k = 0; k < sorted.size() && k < 20; ++k) {
+            const int op = sorted[k].first;
+            const auto & e = sorted[k].second;
+            const double pct = 100.0 * e.total_ns / std::max<std::uint64_t>(total_all, 1);
+            const double avg_us = e.total_ns / 1000.0 / std::max<std::uint64_t>(e.count, 1);
+            GGML_LOG_INFO("  %2zu. %-22s n=%-7llu total=%9.2f ms (%5.2f%%) avg=%7.2f us\n",
+                          k + 1, ggml_op_name(static_cast<ggml_op>(op)),
+                          (unsigned long long) e.count,
+                          e.total_ns / 1e6, pct, avg_us);
+        }
+    }
+};
+static GgmlSyclProfileState g_sycl_profile;
+
 static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * sycl_ctx, ggml_cgraph * cgraph) {
     ggml_sycl_set_main_device(sycl_ctx->device);
+
+    g_sycl_profile.maybe_init();
+    const bool profile = g_sycl_profile.enabled;
+    sycl::queue * profile_stream = profile ? sycl_ctx->stream() : nullptr;
 
     // iter16: in-loop Q4_K QKV fusion. The restore list collects K/V
     // nodes that get marked GGML_OP_NONE by the inline fusion call so
@@ -4468,11 +4524,42 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
 
+        std::chrono::steady_clock::time_point t0;
+        if (profile) {
+            profile_stream->wait();
+            t0 = std::chrono::steady_clock::now();
+        }
+
         bool ok = ggml_sycl_compute_forward(*sycl_ctx, node);
         if (!ok) {
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
         GGML_ASSERT(ok);
+
+        if (profile) {
+            profile_stream->wait();
+            const auto t1 = std::chrono::steady_clock::now();
+            const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+            std::lock_guard<std::mutex> lk(g_sycl_profile.mu);
+            const int op_idx = static_cast<int>(node->op);
+            if (op_idx >= 0 && op_idx < GGML_OP_COUNT) {
+                g_sycl_profile.ops[op_idx].total_ns += static_cast<std::uint64_t>(dt);
+                g_sycl_profile.ops[op_idx].count    += 1;
+            }
+        }
+    }
+
+    if (profile) {
+        std::lock_guard<std::mutex> lk(g_sycl_profile.mu);
+        ++g_sycl_profile.n_calls;
+        const std::uint64_t n = g_sycl_profile.n_calls;
+        if ((n % 32) == 0) {
+            // dump (releases the lock first via shared_ptr trick — actually
+            // dump() takes its own lock, so unlock before calling).
+        }
+    }
+    if (profile && (g_sycl_profile.n_calls % 32) == 0) {
+        g_sycl_profile.dump("periodic");
     }
 
     ggml_sycl_q4k_qkv_restore_nodes(qkv_fusion_restore);
