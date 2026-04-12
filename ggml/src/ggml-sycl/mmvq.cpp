@@ -12,12 +12,14 @@
 #include <cstring>
 #include <cstdlib>
 #include <sycl/ext/intel/esimd.hpp>
+#include <sycl/ext/oneapi/matrix/matrix.hpp>
 #include <unordered_map>
 #include <vector>
 
 namespace {
 
 namespace esimd = sycl::ext::intel::esimd;
+namespace jm = sycl::ext::oneapi::experimental::matrix;
 
 bool ggml_sycl_debug_q4k_cpu_aos_enabled() {
     static const bool enabled = std::getenv("GGML_SYCL_DEBUG_Q4K_CPU_AOS") != nullptr;
@@ -745,6 +747,18 @@ struct ggml_sycl_q4k_stock_timing_summary_printer {
 
 static ggml_sycl_q4k_stock_timing_summary_printer g_q4k_stock_timing_summary_printer;
 
+/* gemma4-ipex iter10: per-device x_half scratch arena for the XMX live path.
+   The x_half buffer is needed per call (activation x changes every step)
+   but its MAX size is bounded by ne0 * TM = 5376 * 8 = 43008 halfs = 86 KB
+   per device for the gated shape. Allocate once per device on first use,
+   reuse across every subsequent call, free never. Eliminates the per-call
+   malloc_device / free overhead that was hurting iter10-rev1. */
+struct ggml_sycl_q4k_xmx_scratch_device {
+    sycl::half * x_half = nullptr;
+    std::size_t  capacity = 0;   // in halfs
+};
+static ggml_sycl_q4k_xmx_scratch_device g_q4k_xmx_scratch[GGML_SYCL_MAX_DEVICES];
+
 const ggml_sycl_q4k_esimd_cached_split * ggml_sycl_debug_q4k_esimd_live_cache_lookup(
     const void * vx,
     int total_blocks,
@@ -974,6 +988,298 @@ void ggml_sycl_debug_q4k_esimd_live(
     }
 
     // Cache owns payload_dev / meta_dev -- no per-call free.
+}
+
+/* gemma4-ipex iter10: XMX-based Q4_K live path using sycl::joint_matrix.
+
+   First real XMX user in llama.cpp's SYCL backend on Arc. Upstream's
+   SYCL_USE_XMX macro is defined but it only switches mmq.cpp tile sizes
+   -- zero calls to joint_matrix anywhere in ggml-sycl. This kernel is
+   the first one to actually drive the A770 matrix engines for Q4_K.
+
+   Kernel structure adapted from src/esimd/linear_forward_q4k_fused_sycl.cpp:197-398
+   (dispatch_linear_forward_q4k_xmx in the cleanroom). Unlike the ESIMD
+   per-row kernel, this uses:
+     - nd_range with 8-thread subgroups (one subgroup per TN=8 output rows)
+     - joint_matrix tiles TM=8 x TN=8 x TK=16 fp16 -> fp32 accumulator
+     - SLM-buffered B tile dequanted from the iter7 cached payload/meta
+     - A tile loaded from a pre-converted fp16 copy of the activation x
+     - one joint_matrix_mad per K-step per subgroup
+
+   Reuses the iter7 per-(device, vx) split cache for the payload/meta
+   input -- no extra cache needed. The only new per-call allocations
+   are (a) the scratch fp16 x_half buffer (small, ne0 * 8 halfs) and
+   (b) the pre-convert kernel launch. Both are removable in entry 11
+   if the base idea works. */
+
+bool ggml_sycl_debug_q4k_xmx_live_enabled() {
+    static const bool enabled = std::getenv("GGML_SYCL_DEBUG_Q4K_XMX_LIVE") != nullptr;
+    return enabled;
+}
+
+bool ggml_sycl_debug_q4k_xmx_live_should_run(int ncols_x, int nrows_x, int ncols_y) {
+    if (!ggml_sycl_debug_q4k_xmx_live_enabled()) {
+        return false;
+    }
+    if (ncols_y != 8 || ncols_x != 5376 || nrows_x <= 0) {
+        return false;
+    }
+    return true;
+}
+
+void ggml_sycl_debug_q4k_xmx_live(
+    const void * vx,
+    const float * x,
+    float * dst,
+    int device,
+    int ncols_x,
+    int row_low,
+    int nrows_x,
+    int ncols_y,
+    size_t dst_col_stride,
+    dpct::queue_ptr stream) {
+    if (!ggml_sycl_debug_q4k_xmx_live_should_run(ncols_x, nrows_x, ncols_y)) {
+        return;
+    }
+
+    {
+        static bool announced[GGML_SYCL_MAX_DEVICES] = {};
+        if (device >= 0 && device < GGML_SYCL_MAX_DEVICES && !announced[device]) {
+            announced[device] = true;
+            GGML_LOG_INFO(
+                "Q4_K XMX LIVE active: device=%d ncols_x=%d nrows_x=%d ncols_y=%d dst_stride=%zu row_low=%d\n",
+                device, ncols_x, nrows_x, ncols_y, dst_col_stride, row_low);
+        }
+    }
+
+    const int n_blocks_per_row = ncols_x / QK_K;
+    const int total_blocks = nrows_x * n_blocks_per_row;
+
+    // Reuse the iter7 cache for the payload/meta split.
+    const auto * entry = ggml_sycl_debug_q4k_esimd_live_cache_lookup(vx, total_blocks, device, stream);
+    if (entry == nullptr) {
+        return;
+    }
+
+    constexpr int TM = 8;
+    constexpr int TN = 8;
+    constexpr int TK = 16;
+    constexpr int kSgSize = 8;
+
+    const int ne0 = ncols_x;  // K dimension
+    const int n_tiles_n = (nrows_x + TN - 1) / TN;
+
+    // Pre-convert activation x (fp32 [ncols_y][ncols_x]) to fp16 in
+    // standard row-major [TM][ne0] layout so joint_matrix_load for tA
+    // can read a TM x TK tile at ptr = x_half + k_start with
+    // stride = ne0 (leading dimension = full K). col_major tA is not
+    // supported on Arc Xe-HPG -- attempting it segfaults at runtime.
+    //
+    // iter10-rev2: reuse the x_half scratch buffer across calls via a
+    // per-device arena. Allocate on first use, grow on larger shapes,
+    // never free. Eliminates per-call malloc_device / free overhead.
+    const std::size_t x_half_size = static_cast<std::size_t>(TM) * ne0;
+    sycl::half * x_half = nullptr;
+    if (device >= 0 && device < GGML_SYCL_MAX_DEVICES) {
+        auto & arena = g_q4k_xmx_scratch[device];
+        if (arena.x_half == nullptr || arena.capacity < x_half_size) {
+            if (arena.x_half != nullptr) {
+                sycl::free(arena.x_half, *stream);
+            }
+            arena.x_half = sycl::malloc_device<sycl::half>(x_half_size, *stream);
+            arena.capacity = x_half_size;
+            GGML_LOG_INFO(
+                "Q4_K XMX LIVE scratch arena: device=%d allocated %zu halfs (%.2f MiB)\n",
+                device, x_half_size,
+                (double) x_half_size * sizeof(sycl::half) / (1024.0 * 1024.0));
+        }
+        x_half = arena.x_half;
+    } else {
+        x_half = sycl::malloc_device<sycl::half>(x_half_size, *stream);
+    }
+    GGML_ASSERT(x_half != nullptr);
+
+    {
+        const auto nc = ncols_y;
+        const auto x_stride = static_cast<size_t>(ncols_x);
+        const auto ne0_cap = ne0;
+        const auto x_src = x;
+        const auto x_h = x_half;
+        stream->submit([&](sycl::handler & h) {
+            h.parallel_for(
+                sycl::range<1>(static_cast<std::size_t>(TM) * ne0),
+                [=](sycl::id<1> idx) {
+                    const std::size_t flat = idx[0];
+                    const std::size_t m = flat / static_cast<std::size_t>(ne0_cap);
+                    const std::size_t k = flat % static_cast<std::size_t>(ne0_cap);
+                    const float v = (static_cast<int>(m) < nc)
+                        ? x_src[m * x_stride + k] : 0.0f;
+                    // row-major [TM][ne0]: element (m, k) at m*ne0+k
+                    x_h[m * static_cast<std::size_t>(ne0_cap) + k] = sycl::half(v);
+                });
+        });
+    }
+
+    // Main GEMM kernel: one subgroup per TN=8 output rows, joint_matrix
+    // over K in steps of TK=16. Dequant B from cached payload/meta
+    // into SLM cooperatively (TN threads, each dequants 1 row of TK
+    // weights per K-step).
+    {
+        const auto payload_base = entry->payload_dev;
+        const auto meta_base = entry->meta_dev;
+        const auto nbpr = n_blocks_per_row;
+        const auto y = dst;
+        const auto nr = nrows_x;
+        const auto nc = ncols_y;
+        const auto y_stride = dst_col_stride;
+        const auto x_h = x_half;
+        const auto ne0_val = ne0;
+
+        stream->submit([&](sycl::handler & cgh) {
+            sycl::local_accessor<sycl::half, 1> slm_b(
+                sycl::range<1>(TK * TN), cgh);
+            sycl::local_accessor<float, 1> slm_c(
+                sycl::range<1>(TM * TN), cgh);
+
+            cgh.parallel_for(
+                sycl::nd_range<1>(
+                    sycl::range<1>(static_cast<std::size_t>(n_tiles_n) * kSgSize),
+                    sycl::range<1>(kSgSize)),
+                [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kSgSize)]] {
+                    auto sg = it.get_sub_group();
+                    const int tile_n = static_cast<int>(it.get_group(0));
+                    const int n_base = tile_n * TN;
+                    const int lid = static_cast<int>(it.get_local_linear_id());
+
+                    // tA is [TM=8][TK=16] row-major. Loaded with stride=ne0
+                    // (the leading dimension of x_half's [TM][ne0] layout).
+                    // col_major tA is not supported on Arc -- would segfault.
+                    jm::joint_matrix<sycl::sub_group, sycl::half,
+                        jm::use::a, TM, TK, jm::layout::row_major> tA;
+                    jm::joint_matrix<sycl::sub_group, sycl::half,
+                        jm::use::b, TK, TN, jm::layout::row_major> tB;
+                    jm::joint_matrix<sycl::sub_group, float,
+                        jm::use::accumulator, TM, TN> tC;
+                    jm::joint_matrix_fill(sg, tC, 0.0f);
+
+                    for (int k_start = 0; k_start < ne0_val; k_start += TK) {
+                        // Load A tile from pre-converted fp16 x. Layout is
+                        // [TM][ne0] row-major, so row stride is ne0. Start
+                        // at x_h + k_start so columns [k_start, k_start+TK)
+                        // are picked up for all TM rows.
+                        auto a_ptr = sycl::address_space_cast<
+                            sycl::access::address_space::global_space,
+                            sycl::access::decorated::no>(x_h + k_start);
+                        jm::joint_matrix_load(sg, tA, a_ptr,
+                            static_cast<std::size_t>(ne0_val));
+
+                        // Dequant TN rows of TK weights into SLM B tile.
+                        // Each thread (lid 0..TN-1) dequants 1 row.
+                        if (lid < TN) {
+                            const int row = n_base + lid;
+                            if (row < nr) {
+                                for (int ki = 0; ki < TK; ++ki) {
+                                    const int k = k_start + ki;
+                                    const int ib = k / 256;
+                                    const int k_in_block = k % 256;
+                                    const std::size_t block_idx =
+                                        static_cast<std::size_t>(row) * nbpr + ib;
+                                    const std::uint8_t * payload =
+                                        payload_base + block_idx * 128;
+                                    const std::uint8_t * meta =
+                                        meta_base + block_idx * 16;
+
+                                    const int pair = k_in_block / 64;
+                                    const int pair_pos = k_in_block % 64;
+                                    const int group = pair * 2 + (pair_pos >= 32 ? 1 : 0);
+                                    const int byte_idx = pair * 32 + (pair_pos % 32);
+                                    const std::uint8_t packed = payload[byte_idx];
+                                    const float nibble = (pair_pos >= 32)
+                                        ? static_cast<float>(packed >> 4)
+                                        : static_cast<float>(packed & 0x0FU);
+
+                                    const std::uint16_t d_raw =
+                                        meta[0] | (static_cast<std::uint16_t>(meta[1]) << 8);
+                                    const std::uint16_t dm_raw =
+                                        meta[2] | (static_cast<std::uint16_t>(meta[3]) << 8);
+                                    auto fp16f = [](std::uint16_t h) -> float {
+                                        std::uint32_t s = (static_cast<std::uint32_t>(h & 0x8000U)) << 16;
+                                        std::uint32_t e = (h >> 10) & 0x1fU;
+                                        std::uint32_t m = h & 0x03ffU;
+                                        if (e == 0x1fU) return 0.0f;
+                                        if (e == 0) {
+                                            if (m == 0) return 0.0f;
+                                            float val = static_cast<float>(m) * (1.0f/1024.0f) * (1.0f/16384.0f);
+                                            return (h & 0x8000U) ? -val : val;
+                                        }
+                                        return sycl::bit_cast<float>(s | ((e + 112U) << 23) | (m << 13));
+                                    };
+                                    const float d_val = fp16f(d_raw);
+                                    const float neg_dmin = -fp16f(dm_raw);
+                                    const std::uint8_t * sc = meta + 4;
+                                    float scale, bias;
+                                    if (group < 4) {
+                                        scale = d_val * static_cast<float>(sc[group] & 0x3FU);
+                                        bias = neg_dmin * static_cast<float>(sc[group + 4] & 0x3FU);
+                                    } else {
+                                        int i = group - 4;
+                                        scale = d_val * static_cast<float>((sc[8 + i] & 0x0FU) | ((sc[i] >> 2) & 0x30U));
+                                        bias = neg_dmin * static_cast<float>((sc[8 + i] >> 4) | ((sc[i + 4] >> 2) & 0x30U));
+                                    }
+                                    const float val = scale * nibble + bias;
+                                    slm_b[ki * TN + lid] = sycl::half(val);
+                                }
+                            } else {
+                                for (int ki = 0; ki < TK; ++ki) {
+                                    slm_b[ki * TN + lid] = sycl::half(0.0f);
+                                }
+                            }
+                        }
+
+                        it.barrier(sycl::access::fence_space::local_space);
+
+                        auto b_ptr = slm_b.template get_multi_ptr<
+                            sycl::access::decorated::no>().get();
+                        jm::joint_matrix_load(sg, tB,
+                            sycl::address_space_cast<
+                                sycl::access::address_space::local_space,
+                                sycl::access::decorated::no>(b_ptr),
+                            static_cast<std::size_t>(TN));
+
+                        jm::joint_matrix_mad(sg, tC, tA, tB, tC);
+
+                        it.barrier(sycl::access::fence_space::local_space);
+                    }
+
+                    // Store accumulator to SLM, then scatter to dst
+                    auto c_slm_ptr = slm_c.template get_multi_ptr<
+                        sycl::access::decorated::no>().get();
+                    jm::joint_matrix_store(sg, tC,
+                        sycl::address_space_cast<
+                            sycl::access::address_space::local_space,
+                            sycl::access::decorated::no>(c_slm_ptr),
+                        static_cast<std::size_t>(TN),
+                        jm::layout::row_major);
+
+                    it.barrier(sycl::access::fence_space::local_space);
+
+                    if (lid == 0) {
+                        for (int m = 0; m < nc; ++m) {
+                            for (int n = 0; n < TN; ++n) {
+                                const int row = n_base + n;
+                                if (row < nr) {
+                                    y[m * y_stride + row] = c_slm_ptr[m * TN + n];
+                                }
+                            }
+                        }
+                    }
+                });
+        });
+    }
+
+    // iter10-rev2: no stream->wait() and no per-call free. The SYCL
+    // in-order queue serializes subsequent ops naturally, and the
+    // x_half buffer is owned by the per-device arena.
 }
 
 } // namespace
@@ -2111,11 +2417,19 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
                 // gemma4-ipex iter8: skip stock MMVQ entirely when the ESIMD
                 // live path will overwrite the result on the gated shape.
                 // Avoids doing the same matmul twice on gated calls.
+                // iter10: also skip when the XMX live path will overwrite.
                 if (ggml_sycl_debug_q4k_esimd_live_should_run(
                         static_cast<int>(ne00),
                         static_cast<int>(row_diff),
                         static_cast<int>(src1_ncols))) {
                     GGML_SYCL_DEBUG("Skipping stock Q4K MMVQ: ESIMD live path owns this shape\n");
+                    break;
+                }
+                if (ggml_sycl_debug_q4k_xmx_live_should_run(
+                        static_cast<int>(ne00),
+                        static_cast<int>(row_diff),
+                        static_cast<int>(src1_ncols))) {
+                    GGML_SYCL_DEBUG("Skipping stock Q4K MMVQ: XMX live path owns this shape\n");
                     break;
                 }
                 // gemma4-ipex iter9: optional stock timing on the gated shape
@@ -2217,6 +2531,17 @@ void ggml_sycl_op_mul_mat_vec_q(ggml_backend_sycl_context & ctx, const ggml_tens
             static_cast<size_t>(dst->ne[0]),
             stream);
         ggml_sycl_debug_q4k_esimd_live(
+            src0_dd_i,
+            src1_ddf_i,
+            dst_dd_i,
+            id,
+            static_cast<int>(ne00),
+            static_cast<int>(row_low),
+            static_cast<int>(row_diff),
+            static_cast<int>(src1_ncols),
+            static_cast<size_t>(dst->ne[0]),
+            stream);
+        ggml_sycl_debug_q4k_xmx_live(
             src0_dd_i,
             src1_ddf_i,
             dst_dd_i,
