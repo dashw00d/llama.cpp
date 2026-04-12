@@ -747,6 +747,60 @@ struct ggml_sycl_q4k_stock_timing_summary_printer {
 
 static ggml_sycl_q4k_stock_timing_summary_printer g_q4k_stock_timing_summary_printer;
 
+/* gemma4-ipex iter11: per-device timing for the XMX live path. Same structure
+   as the iter9 ESIMD and stock timing paths. Enabled via
+   GGML_SYCL_DEBUG_Q4K_XMX_LIVE_TIMING=1. Adds a stream->wait() around the
+   GEMM submit so the chrono clock measures actual kernel completion. */
+
+static ggml_sycl_q4k_stock_timing_stats g_q4k_xmx_live_timing[GGML_SYCL_MAX_DEVICES];
+
+bool ggml_sycl_debug_q4k_xmx_live_timing_enabled() {
+    static const bool enabled = std::getenv("GGML_SYCL_DEBUG_Q4K_XMX_LIVE_TIMING") != nullptr;
+    return enabled;
+}
+
+void ggml_sycl_debug_q4k_xmx_live_timing_record(int device, double ns) {
+    if (device < 0 || device >= GGML_SYCL_MAX_DEVICES) {
+        return;
+    }
+    auto & s = g_q4k_xmx_live_timing[device];
+    s.count++;
+    s.total_ns += ns;
+    if (ns < s.min_ns) s.min_ns = ns;
+    if (ns > s.max_ns) s.max_ns = ns;
+    if (s.count % 200 == 0) {
+        GGML_LOG_INFO(
+            "Q4_K XMX LIVE kernel timing: device=%d count=%llu avg=%.3f ms min=%.3f max=%.3f total=%.2f s\n",
+            device,
+            (unsigned long long) s.count,
+            s.total_ns / (double) s.count / 1e6,
+            s.min_ns / 1e6,
+            s.max_ns / 1e6,
+            s.total_ns / 1e9);
+    }
+}
+
+struct ggml_sycl_q4k_xmx_live_timing_summary_printer {
+    ~ggml_sycl_q4k_xmx_live_timing_summary_printer() {
+        for (int d = 0; d < GGML_SYCL_MAX_DEVICES; ++d) {
+            const auto & s = g_q4k_xmx_live_timing[d];
+            if (s.count == 0) {
+                continue;
+            }
+            GGML_LOG_INFO(
+                "Q4_K XMX LIVE kernel timing SUMMARY device=%d: count=%llu avg=%.3f ms min=%.3f max=%.3f total=%.2f s\n",
+                d,
+                (unsigned long long) s.count,
+                s.total_ns / (double) s.count / 1e6,
+                s.min_ns / 1e6,
+                s.max_ns / 1e6,
+                s.total_ns / 1e9);
+        }
+    }
+};
+
+static ggml_sycl_q4k_xmx_live_timing_summary_printer g_q4k_xmx_live_timing_summary_printer;
+
 /* gemma4-ipex iter10: per-device x_half scratch arena for the XMX live path.
    The x_half buffer is needed per call (activation x changes every step)
    but its MAX size is bounded by ne0 * TM = 5376 * 8 = 43008 halfs = 86 KB
@@ -1120,6 +1174,14 @@ void ggml_sycl_debug_q4k_xmx_live(
         });
     }
 
+    // iter11: optional per-call kernel timing. When
+    // GGML_SYCL_DEBUG_Q4K_XMX_LIVE_TIMING=1, wrap the GEMM submit in
+    // stream->wait() + steady_clock and record stats per device.
+    const bool xmx_timing_enabled = ggml_sycl_debug_q4k_xmx_live_timing_enabled();
+    const auto xmx_kern_t0 = xmx_timing_enabled
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
+
     // Main GEMM kernel: one subgroup per TN=8 output rows, joint_matrix
     // over K in steps of TK=16. Dequant B from cached payload/meta
     // into SLM cooperatively (TN threads, each dequants 1 row of TK
@@ -1277,9 +1339,19 @@ void ggml_sycl_debug_q4k_xmx_live(
         });
     }
 
-    // iter10-rev2: no stream->wait() and no per-call free. The SYCL
-    // in-order queue serializes subsequent ops naturally, and the
-    // x_half buffer is owned by the per-device arena.
+    // iter10-rev2: no stream->wait() and no per-call free in the production
+    // path. The SYCL in-order queue serializes subsequent ops naturally,
+    // and the x_half buffer is owned by the per-device arena.
+    //
+    // iter11: when timing is enabled, force a wait + record so the chrono
+    // clock measures actual kernel completion.
+    if (xmx_timing_enabled) {
+        stream->wait();
+        const auto xmx_kern_t1 = std::chrono::steady_clock::now();
+        ggml_sycl_debug_q4k_xmx_live_timing_record(
+            device,
+            std::chrono::duration<double, std::nano>(xmx_kern_t1 - xmx_kern_t0).count());
+    }
 }
 
 } // namespace
