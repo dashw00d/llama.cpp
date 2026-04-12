@@ -4,6 +4,7 @@
 #include "esimd_fused_qkv_proj.hpp"
 #include "esimd_fused_mlp_gate_up.hpp"
 #include "fused_rms_norm_mul.hpp"
+#include "fused_down_residual.hpp"
 
 #include "ggml.h"
 #include "ggml-quants.h"
@@ -2843,6 +2844,139 @@ bool ggml_sycl_fused_rms_mul_inline(
     };
     mark(nrms);
     mark(mul_node);
+    return true;
+}
+
+// iter24 in-loop fusion: Q4_K MUL_MAT (FFN down projection) + ADD
+// (residual). Pattern: at a Q4_K MUL_MAT node, look forward up to 6
+// nodes for an ADD whose two srcs are (this matmul, some residual
+// tensor). On match dispatches the cooperative-warp fused down +
+// residual kernel writing into the ADD's dst, marks both as
+// GGML_OP_NONE.
+//
+// Distinguishing this from QKV / FFN-gate-up matmul fusions: those
+// match on the *next* Q4_K MUL_MATs sharing src[1]; this matches on
+// the *next* ADD whose src is the matmul. The two helpers never
+// fight over the same node because they detect different downstream
+// op patterns.
+//
+// Default ON because the cooperative-warp pattern matches stock's
+// per-call cost (no per-call regression like iter19/20).
+bool ggml_sycl_fused_down_residual_inline(
+    ggml_backend_sycl_context * sycl_ctx,
+    ggml_cgraph *               cgraph,
+    int                         i,
+    SyclQ4KFusionRestoreList *  restore_list) {
+    static const bool s_enabled =
+        std::getenv("GGML_SYCL_DEBUG_DOWN_RES_FUSION") != nullptr;
+    if (!s_enabled) return false;
+    if (sycl_ctx == nullptr || cgraph == nullptr) return false;
+    if (i < 0 || i >= cgraph->n_nodes) return false;
+
+    ggml_tensor * ndown = cgraph->nodes[i];
+    if (ndown == nullptr || ndown->op != GGML_OP_MUL_MAT) return false;
+    if (ndown->src[0] == nullptr || ndown->src[1] == nullptr) return false;
+    if (ndown->src[0]->type != GGML_TYPE_Q4_K) return false;
+
+    const int device = sycl_ctx->device;
+    if (sycl_buffer_device(ndown->src[0]) != device) return false;
+    if (sycl_buffer_device(ndown->src[1]) != device) return false;
+    if (sycl_buffer_device(ndown) != device) return false;
+
+    // The down matmul has shape M = n_embd (5376), K = ffn_dim (21504).
+    // QKV / gate / up matmuls have ncols_x = 5376 (n_embd as K).
+    // Distinguish by ncols_x: down has ncols_x == 21504 on Gemma 4 31B.
+    const int ncols_x = static_cast<int>(ndown->src[0]->ne[0]);
+    const int n_rows_out = static_cast<int>(ndown->src[0]->ne[1]);
+    const int ncols_y = static_cast<int>(ndown->src[1]->ne[1]);
+    if ((ncols_x % 256) != 0) return false;
+    if (n_rows_out <= 0) return false;
+    if (ncols_y < 1 || ncols_y > 32) return false;
+
+    // Skip QKV/gate/up shapes -- those are handled by the QKV/MLP
+    // helpers. Down has K (ncols_x) much larger than M (n_rows_out)
+    // because of the FFN expansion.
+    if (ncols_x <= n_rows_out) return false;
+
+    // Walk forward looking for an ADD where one src is exactly ndown
+    // and the other src is the residual. Note: this pattern matches
+    // Llama / Qwen / Mistral (matmul -> add(residual) -> norm) but
+    // does NOT match Gemma 4 (matmul -> post_norm -> mul -> add) --
+    // see iter24 entry in ITERATION_LOG.md for the structural
+    // explanation. The helper is kept in tree for non-Gemma models.
+    const int kSearchWindow = 6;
+    int  add_idx = -1;
+    ggml_tensor * add_node = nullptr;
+    const ggml_tensor * residual_src = nullptr;
+    const int j_max = std::min(cgraph->n_nodes, i + 1 + kSearchWindow);
+    for (int j = i + 1; j < j_max; ++j) {
+        ggml_tensor * nj = cgraph->nodes[j];
+        if (nj == nullptr) continue;
+        if (nj->op != GGML_OP_ADD) continue;
+        if (nj->src[0] == nullptr || nj->src[1] == nullptr) continue;
+        const ggml_tensor * a = nj->src[0];
+        const ggml_tensor * b = nj->src[1];
+        const ggml_tensor * other = nullptr;
+        if (a == ndown) other = b;
+        else if (b == ndown) other = a;
+        else continue;
+        if (other == nullptr) continue;
+        if (other->ne[0] != ndown->ne[0]) continue;
+        if (other->ne[1] != ndown->ne[1]) continue;
+        if (other->type != GGML_TYPE_F32) continue;
+        if (sycl_buffer_device(nj) != device) continue;
+        if (sycl_buffer_device(other) != device) continue;
+        if (!ggml_is_contiguous(nj)) continue;
+        if (!ggml_is_contiguous(other)) continue;
+        if (!ggml_is_contiguous(ndown)) continue;
+        residual_src = other;
+        add_idx  = j;
+        add_node = nj;
+        break;
+    }
+    if (add_idx < 0 || add_node == nullptr || residual_src == nullptr) return false;
+
+    static int s_count[GGML_SYCL_MAX_DEVICES] = {};
+    static int s_total = 0;
+    if (device >= 0 && device < GGML_SYCL_MAX_DEVICES) s_count[device]++;
+    s_total++;
+    if (s_total <= 5 || (s_total % 200) == 0) {
+        GGML_LOG_INFO("Down+Res inline-fuse #%d device=%d nodes=%d,%d "
+                      "ncols_x=%d n_rows_out=%d ncols_y=%d "
+                      "(total dev0=%d dev1=%d dev2=%d)\n",
+                      s_total, device, i, add_idx,
+                      ncols_x, n_rows_out, ncols_y,
+                      s_count[0], s_count[1], s_count[2]);
+    }
+
+    sycl::queue * stream = sycl_ctx->stream();
+
+    ggml_sycl_fused_down_residual_args fargs{};
+    fargs.vx                  = ndown->src[0]->data;
+    fargs.x                   = static_cast<const float *>(ndown->src[1]->data);
+    fargs.x_col_stride        = static_cast<std::size_t>(ndown->src[1]->nb[1] / sizeof(float));
+    fargs.residual            = static_cast<const float *>(residual_src->data);
+    fargs.residual_col_stride = static_cast<std::size_t>(residual_src->nb[1] / sizeof(float));
+    fargs.dst                 = static_cast<float *>(add_node->data);
+    fargs.dst_col_stride      = static_cast<std::size_t>(add_node->nb[1] / sizeof(float));
+    fargs.ncols_x             = ncols_x;
+    fargs.n_rows_out          = n_rows_out;
+    fargs.n_cols              = ncols_y;
+    if (fargs.vx == nullptr || fargs.x == nullptr || fargs.residual == nullptr || fargs.dst == nullptr) {
+        return false;
+    }
+
+    ggml_sycl_fused_down_residual_dispatch(*stream, fargs);
+
+    auto mark = [&](ggml_tensor * n) {
+        if (n == nullptr) return;
+        if (restore_list != nullptr) {
+            restore_list->push_back({n, static_cast<int>(n->op)});
+        }
+        n->op = GGML_OP_NONE;
+    };
+    mark(ndown);
+    mark(add_node);
     return true;
 }
 

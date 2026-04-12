@@ -4524,6 +4524,17 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
             continue;
         }
 
+        // iter24: FFN down + residual fusion. Different shape gate
+        // (ncols_x > n_rows_out) than QKV/MLP gate-up so it can't
+        // mis-fire on those nodes even though they're all Q4_K MUL_MAT.
+        // Cooperative-warp pattern matches stock's per-call cost --
+        // no per-call regression. Env-gated by
+        // GGML_SYCL_DEBUG_DOWN_RES_FUSION=1, default OFF until iter24
+        // bench measures the actual delta.
+        if (ggml_sycl_fused_down_residual_inline(sycl_ctx, cgraph, i, &qkv_fusion_restore)) {
+            continue;
+        }
+
         std::chrono::steady_clock::time_point t0;
         if (profile) {
             profile_stream->wait();

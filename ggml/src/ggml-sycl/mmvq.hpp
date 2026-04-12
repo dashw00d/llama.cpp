@@ -85,4 +85,23 @@ bool ggml_sycl_fused_rms_mul_inline(
     int                         i,
     SyclQ4KFusionRestoreList *  restore_list);
 
+// iter24: fused FFN down-projection + residual ADD detection + dispatch.
+// Pattern: a Q4_K MUL_MAT node (the FFN down projection) followed
+// (within a small window) by a GGML_OP_ADD where one src is exactly
+// the matmul node and the other src is the FFN block's residual
+// (the pre-RMS-norm input that was saved before the FFN block). On
+// match dispatches the fused down + residual kernel writing into
+// the ADD's dst, marks both as GGML_OP_NONE.
+//
+// Saves one launch per FFN per layer (60 per graph_compute on
+// Gemma 4 31B). The kernel uses the same SG=16 cooperative-warp
+// pattern stock's mmvq uses, so per-call cost is at parity with
+// the unfused stock down matmul -- the launch savings are net
+// positive (no per-call regression like iter19/20 had).
+bool ggml_sycl_fused_down_residual_inline(
+    ggml_backend_sycl_context * sycl_ctx,
+    ggml_cgraph *               cgraph,
+    int                         i,
+    SyclQ4KFusionRestoreList *  restore_list);
+
 #endif // GGML_SYCL_MMVQ_HPP
