@@ -3547,6 +3547,28 @@ static bool should_reorder_tensor(ggml_backend_sycl_context& ctx, const ggml_ten
             dst->src[1]->ne[1]==1 && dst->src[1]->ne[2]==1 && dst->src[1]->ne[3]==1;
 }
 
+// iter28 (fix B6 v2): the in-loop QKV fusion helper reads Q4_K weights
+// via the iter18 SoA cache which assumes ggml's AoS block_q4_K layout
+// (144 bytes/block). stock reorder_qw_q4_k rewrites those bytes in
+// place to an SoA layout the cache builder would misread. We must
+// skip reorder for the three tensors that feed the QKV fusion trio --
+// but NOT for FFN gate/up/down or other Q4_K tensors, because Gemma 4
+// has post-norm FFN placement that blocks MLP fusion, so those tensors
+// still benefit from stock's reorder optimization on decode.
+static inline bool tensor_is_qkv_projection(const ggml_tensor * t) {
+    if (t == nullptr || t->name[0] == '\0') return false;
+    // Match `blk.N.attn_{q,k,v}.weight` — the trailing dot rules out
+    // `attn_q_norm`, `attn_q_a`, `attn_qkv` (fused single-weight GQA).
+    const char * n = t->name;
+    const char * p = strstr(n, ".attn_");
+    if (p == nullptr) return false;
+    p += 6;  // skip ".attn_"
+    if ((p[0] == 'q' || p[0] == 'k' || p[0] == 'v') && p[1] == '.') {
+        return true;
+    }
+    return false;
+}
+
 static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor * src0, const ggml_tensor * /* src1 */,
                             ggml_tensor * dst, mul_mat_algo mm_algorithm) {
     if (!should_reorder_tensor(*ctx, dst)) {
@@ -3556,6 +3578,16 @@ static void opt_for_reorder(ggml_backend_sycl_context * ctx, const ggml_tensor *
     ggml_tensor_extra_gpu * extra = static_cast<ggml_tensor_extra_gpu *>(src0->extra);
     if (!extra || extra->optimized_feature.reorder) {
         return;  // Skip permutations and already reordered tensors
+    }
+
+    // iter28 (fix B6 v2): skip reorder for QKV projection tensors when
+    // Q4_K fusion is enabled, so the SoA cache in mmvq.cpp reads the
+    // untouched AoS bytes. All other Q4_K tensors (FFN gate/up/down,
+    // output) take the normal reorder path.
+    if (src0->type == GGML_TYPE_Q4_K && tensor_is_qkv_projection(src0)) {
+        const char * e = std::getenv("GGML_SYCL_DEBUG_Q4K_QKV_FUSION");
+        const bool fusion_on = (e == nullptr) || !(e[0] == '0' && e[1] == '\0');
+        if (fusion_on) return;
     }
 
     switch (mm_algorithm) {

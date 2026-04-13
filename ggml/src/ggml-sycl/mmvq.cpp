@@ -2188,12 +2188,15 @@ SyclQ4KFusionRestoreList ggml_sycl_q4k_qkv_prefuse_pass(
         if (nq->src[1]->ne[1] != nk->src[1]->ne[1] ||
             nq->src[1]->ne[1] != nv->src[1]->ne[1]) continue;
 
-        // Shape gate: same as iter13's scalar kernel (ncols_y == 8,
-        // ncols_x == 5376) since we're reusing iter14's fused kernel
-        // which is built on iter13's math.
+        // iter28 (fix B1): widened from ncols_y==8 and ncols_x==5376 to
+        // match the main ggml_sycl_q4k_qkv_fuse_inline gate. Dormant
+        // pre-pass path; kept in sync for consistency even though it
+        // isn't called from graph_compute_impl in iter16+ architecture.
         const int ncols_x = static_cast<int>(nq->src[0]->ne[0]);
         const int ncols_y = static_cast<int>(nq->src[1]->ne[1]);
-        if (ncols_y != 8 || ncols_x != 5376) continue;
+        if (ncols_y < 4 || ncols_y > 32) continue;
+        if ((ncols_x % 256) != 0) continue;
+        if (ncols_x < 1024 || ncols_x > 16384) continue;
 
         PendingQ4K q_op = make_pending_from_tensor(nq);
         PendingQ4K k_op = make_pending_from_tensor(nk);
@@ -2322,7 +2325,15 @@ bool ggml_sycl_q4k_qkv_fuse_inline(
     // for the iter22 batch-scaling bench (-npl 8/16/32). The fused
     // kernels were updated to acc[32] in the same iter22 commit.
     if (ncols_y < 4 || ncols_y > 32) return false;
-    if (ncols_x != 5376) return false;
+    // iter28 (fix B1): the gate was hardcoded `ncols_x != 5376` which
+    // is Gemma 4 31B's n_embd. Qwen3-32B (n_embd=5120), Llama 3 8B
+    // (n_embd=4096), Mistral 7B (n_embd=4096), and every other
+    // conventional model could not pass this gate, so the helper
+    // NEVER FIRED on any non-Gemma model. iter25's "+48% PP on Qwen3"
+    // claim was misattributed -- QKV fusion was not actually firing.
+    // Widened to accept any Q4K-aligned ncols_x. Agent 2 finding #1.
+    if ((ncols_x % 256) != 0) return false;
+    if (ncols_x < 1024 || ncols_x > 16384) return false;
 
     PendingQ4K q_op = make_pending_from_tensor(nq);
     PendingQ4K k_op = make_pending_from_tensor(nk);

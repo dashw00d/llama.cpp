@@ -181,7 +181,13 @@ void ggml_sycl_esimd_q4k_fused_dispatch(
 
     const std::size_t n_rows = static_cast<std::size_t>(args.n_rows);
 
-    queue.submit([&](sycl::handler & cgh) {
+    // iter28 (fix B4): outer submit lambda was `[&]` (capture-by-ref).
+    // Same iter17 bug shape as run_q4k_fused_qkv: the async kernel can
+    // outlive the dispatch function's stack frame, and the inner kernel
+    // lambda's `[=]` re-captures through dead stack refs. The iter17
+    // fix of changing to `[=]` on the outer submit lambda was only
+    // applied to run_q4k_fused_qkv, not here or in fused_rms_norm_mul.
+    queue.submit([=](sycl::handler & cgh) {
         const auto payload_base = args.payload;
         const auto meta_base    = args.meta;
         const auto nbpr         = args.n_blocks_per_row;

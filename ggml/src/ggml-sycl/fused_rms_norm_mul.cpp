@@ -24,7 +24,9 @@ void ggml_sycl_fused_rms_norm_mul_dispatch(
     float *           dst    = args.dst;
     const float *     d_nw   = args.norm_weight;
 
-    queue.submit([&](sycl::handler & h) {
+    // iter28 (fix B4): `[&]` → `[=]` to avoid the iter17-class dangling-
+    // capture bug. Matches the fix applied to esimd_q4k_fused.cpp:184.
+    queue.submit([=](sycl::handler & h) {
         sycl::local_accessor<float, 1> scratch(sycl::range<1>(wg), h);
         h.parallel_for(
             sycl::nd_range<1>(n_rows * wg, wg),
@@ -38,16 +40,21 @@ void ggml_sycl_fused_rms_norm_mul_dispatch(
                 for (std::size_t i = lid; i < ne0; i += wg) {
                     ss += src[base + i] * src[base + i];
                 }
-                scratch[lid] = ss;
-                it.barrier(sycl::access::fence_space::local_space);
 
-                // Tree reduction in SLM.
-                for (std::size_t s = wg / 2; s > 0; s >>= 1) {
-                    if (lid < s) {
-                        scratch[lid] += scratch[lid + s];
-                    }
-                    it.barrier(sycl::access::fence_space::local_space);
-                }
+                // iter28 (fix B5): the cleanroom used a tree reduction
+                // `for (s = wg/2; s > 0; s >>= 1)` which drops partials
+                // if `wg` is not a power of two. `wg = min(ne0, 256)`
+                // is safe for Gemma 4 (ne0 ∈ {256, 5376→256}) and any
+                // pow2 head_dim, but breaks for models with head_dim
+                // 192 / non-pow2 ne0 < 256. Use sycl::reduce_over_group
+                // which handles arbitrary work-group sizes correctly.
+                const float total = sycl::reduce_over_group(
+                    it.get_group(), ss, sycl::plus<float>());
+                // Broadcast via SLM to avoid each thread recomputing
+                // the sqrt (also keeps the scratch buffer usage we
+                // already allocate for ABI stability).
+                if (lid == 0) scratch[0] = total;
+                it.barrier(sycl::access::fence_space::local_space);
 
                 const float inv = 1.0f / sycl::sqrt(scratch[0] / static_cast<float>(ne0) + eps);
 

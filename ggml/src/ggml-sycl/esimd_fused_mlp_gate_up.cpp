@@ -12,12 +12,26 @@ namespace {
 
 namespace esimd_ns = sycl::ext::intel::esimd;
 
+// iter28 (fix B2): the cleanroom shipped this helper with the
+// subnormal exponent branch collapsed to `return 0.0f`, which silently
+// zeros every Q4K block whose `d` or `dmin` lands in the fp16 subnormal
+// range. Exactly the bug PROVEN-KERNEL-ARCHITECTURE.md §3 #2 documents
+// (`WHY-IPEX-IS-FAST.md` §8). Port copied it verbatim from
+// src/esimd/fused_mlp_gate_up.cpp:46. Replaced with the proper
+// subnormal path used by every other port helper (Q4K, QKV-proj,
+// Q6K, Down+Res).
 inline float mlp_gate_up_fp16(std::uint16_t h) {
     const std::uint32_t sign = (static_cast<std::uint32_t>(h & 0x8000U)) << 16;
     const std::uint32_t exp  = (h >> 10) & 0x1fU;
     const std::uint32_t mant = h & 0x03ffU;
-    if (exp == 0 || exp == 0x1fU) return 0.0f;
-    return sycl::bit_cast<float>(sign | ((exp + 112) << 23) | (mant << 13));
+    if (exp == 0x1fU) return 0.0f;  // inf / nan → 0
+    if (exp == 0) {
+        if (mant == 0) return 0.0f;
+        // Subnormal fp16: value = (-1)^sign * 2^-14 * (mant/1024)
+        float val = static_cast<float>(mant) * (1.0f / 1024.0f) * (1.0f / 16384.0f);
+        return (h & 0x8000U) ? -val : val;
+    }
+    return sycl::bit_cast<float>(sign | ((exp + 112U) << 23) | (mant << 13));
 }
 
 // Q4K row dot product for all n_cols columns -- vectorized block_load
