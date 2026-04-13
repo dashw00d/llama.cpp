@@ -1895,7 +1895,19 @@ struct PendingQ4KQkvState {
 static PendingQ4KQkvState g_pending_q4k_qkv[GGML_SYCL_MAX_DEVICES];
 
 bool ggml_sycl_debug_q4k_qkv_fusion_enabled() {
-    static const bool enabled = std::getenv("GGML_SYCL_DEBUG_Q4K_QKV_FUSION") != nullptr;
+    // iter26: defaulted ON. The iter25 cross-model bench measured
+    // +48% PP at zero TG cost on Qwen3-32B Q4_K_M for QKV fusion
+    // (validates the iter16-iter24 architecture on the model the
+    // cleanroom was developed against). Gemma 4 31B doesn't expose
+    // the lever due to post-norm placement (see iter24), but the
+    // fusion path produces correct output there too, so default-on
+    // is safe on both models. Explicit opt-out via
+    // GGML_SYCL_DEBUG_Q4K_QKV_FUSION=0 for bisecting.
+    static const bool enabled = []() {
+        const char * e = std::getenv("GGML_SYCL_DEBUG_Q4K_QKV_FUSION");
+        if (e == nullptr) return true;
+        return !(e[0] == '0' && e[1] == '\0');
+    }();
     return enabled;
 }
 
@@ -2891,7 +2903,15 @@ bool ggml_sycl_fused_down_residual_inline(
     const int ncols_y = static_cast<int>(ndown->src[1]->ne[1]);
     if ((ncols_x % 256) != 0) return false;
     if (n_rows_out <= 0) return false;
-    if (ncols_y < 1 || ncols_y > 32) return false;
+    // iter26: gate ncols_y >= 4. iter25 measured -56% TG on Qwen3-32B
+    // when this fused kernel fired at decode time (ncols_y == 1) --
+    // stock llama.cpp dispatches ggml_sycl_op_dequantize_mul_mat_vec
+    // ("dmmv") for ncols_y == 1 which is heavily specialized for the
+    // matrix-vector case, and our cooperative-warp Q4K MMVQ pays
+    // cooperative-reduce overhead regardless of ncols_y. Only fire
+    // this fusion during prompt eval (ncols_y >= 4) where the
+    // cooperative pattern wins on the per-call math.
+    if (ncols_y < 4 || ncols_y > 32) return false;
 
     // Skip QKV/gate/up shapes -- those are handled by the QKV/MLP
     // helpers. Down has K (ncols_x) much larger than M (n_rows_out)
